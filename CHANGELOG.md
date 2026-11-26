@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.0 - 2026-11-26
+
+- Radeon 8060S: the prompt attention computes its relative-position bias itself instead of reading a precomputed table.
+  Prompt reading 1,426 -> 1,621 tok/s at 4K tokens, 1,236 -> 1,368 at 32K. Same tokens as before. The RX 7900 XT keeps the
+  table (faster there). `IK2_FLASH_INL1=0` / `1` forces either.
+
 ## 1.1.0 - 2026-11-26
 
 - FP8 KV cache: single-token attention runs on the matrix cores (WMMA), as with the FP16 cache. Decode with `-Fp8Kv` on an

@@ -14,12 +14,11 @@
 | Prompt tokens | XT prompt | XT decode | 8060S prompt | 8060S decode |
 |---|---|---|---|---|
 | 27 | - | 109 | - | 47 |
-| 511 | 2,330 | 106 | 1,110 | 46 |
-| 4,095 | 3,800 | 102 | 1,485 | 45 |
-| 32,760 | 3,490 | 91 | 1,270 | 36 |
+| 511 | 2,330 | 106 | 1,080 | 46 |
+| 4,095 | 3,800 | 102 | 1,620 | 45 |
+| 32,760 | 3,490 | 91 | 1,370 | 36 |
 
-Prompt chunk 4,096. Decode is over 200-400 generated tokens. With `IK2_FLASH2=4` the 8060S reads 4,095 tokens at 1,701-1,716
-and 32,760 at 1,314-1,450 (two rounds).
+Prompt chunk 4,096. Decode is over 200-400 generated tokens.
 
 ### Decode before and after the latency work
 
@@ -57,6 +56,19 @@ XT at a 64K context. On the 8060S the generated tokens are the same; on the XT t
 
 Run-to-run spread on the XT reached 20% for 128-511-token prompts; differences of a few percent there are noise.
 
+### Relative bias in the attention kernel (8060S)
+
+Chunk 4,096, 3 rounds unless stated. The generated tokens are identical with and without it, on both GPUs.
+
+| Prompt | Bias table | Bias in the kernel |
+|---|---|---|
+| 511 (2 rounds) | 1,021 | 1,082 |
+| 4,095 | 1,441 1,426 1,405 | 1,621 1,620 1,628 |
+| 32,760 | 1,278 1,236 1,225 | 1,385 1,368 1,317 |
+| 4,095, FP8 cache (2 rounds) | 1,451 | 1,663 |
+
+On the RX 7900 XT the same change read 4,095 tokens at 3,387 tok/s against 3,615 with the table, so the XT keeps the table.
+
 ### FP8 cache
 
 Decode with `IK2_KV=fp8` (chunk 2,048, context 131,072 on the XT), before and after the matrix-core FP8 attention, 2 rounds:
@@ -76,7 +88,7 @@ Same GGUF and FP16 KV cache, each engine's own benchmark command, so differences
 | | XT prompt 512 | XT prompt 4,096 | XT decode after 4,096 | 8060S prompt 512 | 8060S decode |
 |---|---|---|---|---|---|
 | strata-inkling 0.1.67 | 2,048-2,064 | 2,028-2,031 | 70.7-70.8 | ~894 | 28.7-31 |
-| this build | 2,330 (1,890-2,060 in a server) | 3,800 | ~102 | 1,110 | 45-47 |
+| this build | 2,330 (1,890-2,060 in a server) | 3,800 | ~102 | 1,080 | 45-47 |
 
 The strata-inkling 8060S figures are from an earlier run.
 

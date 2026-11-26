@@ -18,7 +18,7 @@ card is the 64 GB variant.
 
 ## Submitting a recipe
 
-1. The recipe files pin the engine to release `v1.1.0` of this repository.
+1. The recipe files pin the engine to release `v1.0.0` of this repository.
 2. On the machine with the card, start the server (`serve.ps1`, see the main README) with the recipe's settings.
 3. In a clone of the registry, run its tool against that server:
    `python3 lab/lab.py try --on endpoint --endpoint http://127.0.0.1:18000/v1 ...` (see the registry's README for the

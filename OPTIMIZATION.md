@@ -60,7 +60,14 @@ and dividing the difference by the number of visits.
 | Layers 20-23 (five other formats) decoded inside the same tiles | 2,510 -> 3,102 (4K), 1,207 -> 1,494 (511) | 1,305 -> 1,359, 784 -> 998 |
 | Warm-up at load: buffers at full size and first kernel launches (first prompt only) | 1,557 -> 2,248 (511) | 910 -> 1,058 |
 | Expert inputs read in place; fused projections written to their final place | 3,457 -> 3,490 (4K) | 1,355 -> 1,382 |
+| Relative-position bias computed in the attention kernel instead of a table (8060S only; same tokens) | 3,615 -> 3,387: not used | 1,426 -> 1,621 (4K), 1,236 -> 1,368 (32K) |
 | Prompt chunks of 4,096 tokens instead of 2,048 (a setting) | 3,539 -> 3,802 (4K), 3,279 -> 3,493 (32K) | 1,420 -> 1,485, 1,214 -> 1,272 |
+
+The prompt attention adds a learned bias that depends on the distance between query and key. It was computed as a separate
+[tokens][heads][1,024 distances] F32 table, about 400 MB per layer visit at 4K tokens, written by one kernel and read by the
+attention. The attention kernel now computes each value itself from the query's 16 relative values (kept in shared memory),
+in the table kernel's order of operations, so the results are identical. The 8060S, which waits for memory, gains 11-14%;
+the RX 7900 XT, which does not, loses 6%, so it keeps the table.
 
 Layers 20-23 are 4 of 48 visits but took 40% of the expert time at 511 tokens while each of their experts ran as its own
 decode and product. The first expert launch of a process took 55 ms on the XT against about 2 ms later, which is what

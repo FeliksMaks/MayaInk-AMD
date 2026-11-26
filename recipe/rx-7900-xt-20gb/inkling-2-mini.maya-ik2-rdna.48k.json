@@ -1,1 +1,1 @@
-{"model":"inkling-2-mini","weights":"unsloth/Inkling-2-Mini-GGUF@ae9327c5fbc7333116ba32eee78bb5d2bbefae4f","engine":"maya-ik2-rdna@v1.1.0","set":{"ctx":49152,"chunk":4096},"card":"rx-7900-xt-20gb","proof":[]}
+{"model":"inkling-2-mini","weights":"unsloth/Inkling-2-Mini-GGUF@ae9327c5fbc7333116ba32eee78bb5d2bbefae4f","engine":"maya-ik2-rdna@v1.0.0","set":{"ctx":49152,"chunk":4096},"card":"rx-7900-xt-20gb","proof":[]}

@@ -739,17 +739,19 @@ __global__ void moe_rows_combine_kernel(const float* __restrict__ y, const int* 
 // shared memory a block, so that several blocks share a CU (64 keys a tile with the bias in shared memory: 54 KB,
 // one block a CU, 1.3x slower).
 constexpr int kRfBN = 32, kRfLd = kFaD + 8, kRfVld = kRfBN + 8;
-template <class KVT, int kRfNW>
+template <class KVT, int kRfNW, bool INL = false>
 __global__ void __launch_bounds__(kRfNW * 32)
 attn_flash_rdna_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __restrict__ kc,
                        const KVT* __restrict__ vc, int kv_cap, int H, int KV, int Tq, int qpos0, float qk_scale,
                        const float* __restrict__ bias, int extent, int window, int n_split, float* __restrict__ o_part,
-                       float2* __restrict__ ml_part) {
+                       float2* __restrict__ ml_part, const float* __restrict__ rq = nullptr,
+                       const float* __restrict__ proj = nullptr) {
 #if defined(MAYA_RDNA_WMMA)
     using namespace maya::kernels;
     __shared__ __align__(16) uint16_t Ks[kRfBN * kRfLd];          // [key][dim]
     __shared__ __align__(16) uint16_t Vt[kFaD * kRfVld];          // [dim][key]
     __shared__ __align__(16) uint16_t Pss[kRfNW * 16 * kRfVld];   // each warp's P [16][key]
+    __shared__ __align__(16) float Rs[INL ? 16 * kRfNW * 16 : 4];   // (INL: the block's queries' 16 relative values)
     constexpr bool F8 = sizeof(KVT) == 1;
     const int tid = threadIdx.x, warp = tid >> 5, hi = (tid & 31) >> 4, ln = tid & 15;
     uint16_t* Ps = Pss + warp * 16 * kRfVld;
@@ -762,6 +764,13 @@ attn_flash_rdna_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __
     const int per = (n_tiles + n_split - 1) / n_split;
     const int t0 = min(n_tiles, split * per), t1 = min(n_tiles, t0 + per);
     const int wi = i0 + warp * 16;
+    if constexpr (INL) {
+        for (int c = tid; c < BM * 4; c += kRfNW * 32) {
+            const int qi = i0 + (c >> 2);
+            ((float4*) Rs)[c] = qi < Tq ? ((const float4*) (rq + ((size_t) qi * H + h) * 16))[c & 3] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        __syncthreads();
+    }
     wmma_h16 qf[kFaD / 16];   // (the lane's query row wi + ln, its 128 dims)
     {
         const int iq = wi + ln;
@@ -794,7 +803,7 @@ attn_flash_rdna_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __
         // (AMD port: the bias asked for before the tile's barriers and products - the wait for it in their middle was more
         //  than half of this kernel on the 8060S)
         float bv[8][kRfBN / 16];
-        if (any && near) {
+        if (!INL && any && near) {
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 const int ia = wi + wmma_row(i, hi);
@@ -859,7 +868,21 @@ attn_flash_rdna_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __
             for (int j = 0; j < kRfBN / 16; ++j) {
                 const int kp = kt + 16 * j + ln, dist = qa - kp;
                 float v = s[j][i] * sc;
-                if (near && ia < Tq && dist >= 0 && dist < extent) v += bv[i][j] * kLog2e;
+                if (near && ia < Tq && dist >= 0 && dist < extent) {
+                    if constexpr (INL) {   // (relb_kernel's order: the same bits as the table)
+                        const float4* pp = (const float4*) (proj + (size_t) dist * 16);
+                        const float4* rr = (const float4*) (Rs + (warp * 16 + wmma_row(i, hi)) * 16);
+                        float b = 0.0f;
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) {
+                            const float4 x = pp[e], y = rr[e];
+                            b = fmaf(x.w, y.w, fmaf(x.z, y.z, fmaf(x.y, y.y, fmaf(x.x, y.x, b))));
+                        }
+                        v += b * kLog2e;
+                    } else {
+                        v += bv[i][j] * kLog2e;
+                    }
+                }
                 v = (dist < 0 || kp < qa - window + 1 || ia >= Tq) ? -INFINITY : v;
                 s[j][i] = v;
                 mxi = fmaxf(mxi, v);
@@ -1365,7 +1388,14 @@ void attn_flash_rdna(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* vc
     // (queries a block: 64, or 128 that share one read of the keys and values - IK2_FLASH_NW=4 / 8)
     static const int nw = std::getenv("IK2_FLASH_NW") ? std::atoi(std::getenv("IK2_FLASH_NW")) : (rdna_igpu() ? 8 : 4);
     const dim3 grid((unsigned) ((Tq + 16 * nw - 1) / (16 * nw)), (unsigned) H, (unsigned) n_split);
-    if (nw == 8)
+    if (g_flash_rq && nw == 8)
+        attn_flash_rdna_kernel<KVT, 8, true><<<grid, 256, 0, s>>>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, qk_scale, bias,
+                                                                  extent, window, n_split, o_part, ml_part, g_flash_rq, g_flash_proj);
+    else if (g_flash_rq)
+        attn_flash_rdna_kernel<KVT, 4, true><<<dim3((unsigned) ((Tq + 63) / 64), (unsigned) H, (unsigned) n_split), 128, 0, s>>>(
+            q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, qk_scale, bias, extent, window, n_split, o_part, ml_part, g_flash_rq,
+            g_flash_proj);
+    else if (nw == 8)
         attn_flash_rdna_kernel<KVT, 8><<<grid, 256, 0, s>>>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, qk_scale, bias,
                                                             extent, window, n_split, o_part, ml_part);
     else
@@ -1572,7 +1602,10 @@ static bool rdna_n256(bool gu) {   // (IK2_RDNA_N256: bit 0 gate / up, bit 1 dow
 bool flash_inline_bias(const float* rq, const float* proj, int d_rel, bool fp8) {
     static const bool on = !(std::getenv("IK2_FLASH_INL") && !std::atoi(std::getenv("IK2_FLASH_INL"))) &&
                            (std::getenv("IK2_FLASH2") ? std::atoi(std::getenv("IK2_FLASH2")) != 0 : false) && rdna_wmma_gpu();
-    g_flash_rq = on && d_rel == 16 && !fp8 ? rq : nullptr, g_flash_proj = proj;
+    // (the default kernel computes the bias itself too, for either cache: on an RDNA 3.5 APU, whose kernels wait for memory -
+    //  8060S, 4K: 1,426 -> 1,621 tok/s; a 7900 XT: 3,615 -> 3,387, so off there. IK2_FLASH_INL1=0 / 1: off / on)
+    static const bool on1 = (std::getenv("IK2_FLASH_INL1") ? std::atoi(std::getenv("IK2_FLASH_INL1")) != 0 : rdna_igpu()) && rdna_wmma_gpu();
+    g_flash_rq = d_rel == 16 && ((on && !fp8) || on1) ? rq : nullptr, g_flash_proj = proj;
     return g_flash_rq != nullptr;
 }
 bool experts_rdna_in_place() {   // (the gate / up tiles can read a gidx)
