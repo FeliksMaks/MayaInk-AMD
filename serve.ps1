@@ -2,9 +2,10 @@
 #   .\serve.ps1 -Upstream C:\src\maya-inkling-mini -Model C:\models\Inkling-2-Mini-UD-IQ4_XS.gguf [-Gpu 7900] [-Context 49152]
 # -Upstream: a checkout of alesha-pro/maya-inkling-mini at commit c520fd1 (only its Python server and tokenizer tool are used).
 # -Context: tokens of one chat. On a 20 GB card: up to 65536 with the FP16 cache, up to 131072 with -Fp8Kv.
+# -NoGateFuse: the loop gates in two passes, as in version 1.2.0 (its exact output; prompts ~5% slower).
 # -Chunk: prompt tokens read at once; 0 picks 4096 up to a 48K context, 3072 up to 64K, 2048 above (a full card gets slow).
 param([Parameter(Mandatory)][string]$Upstream, [Parameter(Mandatory)][string]$Model, [string]$Gpu = "7900",
-      [int]$Context = 49152, [int]$Chunk = 0, [switch]$Fp8Kv, [int]$Port = 18000, [string]$Venv, [string]$Exe)
+      [int]$Context = 49152, [int]$Chunk = 0, [switch]$Fp8Kv, [int]$Port = 18000, [string]$Venv, [string]$Exe, [switch]$NoGateFuse)
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $Venv) { $Venv = Join-Path $here ".venv" }
@@ -31,6 +32,7 @@ $cfg = @{
     env = @{ IK2_GATE_BF16 = "1"; IK2_GATE_TILE = "64"; HIP_VISIBLE_DEVICES = "$idx" }
 }
 if ($Fp8Kv) { $cfg.env.IK2_KV = "fp8" }
+if (-not $NoGateFuse) { $cfg.env.IK2_GATE_FUSE = "16" }   # (-NoGateFuse: version 1.2.0's exact output)
 $cfgPath = Join-Path $here "build\serve-config.json"
 $cfg | ConvertTo-Json -Depth 5 | Set-Content -Path $cfgPath -Encoding utf8
 "GPU $Gpu (HIP device $idx), context $Context, chunk $Chunk - http://127.0.0.1:$Port/v1, model inkling-2-mini"

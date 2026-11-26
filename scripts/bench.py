@@ -26,6 +26,7 @@ a = ap.parse_args()
 env = dict(os.environ, IK2_UNSUPPORTED="1")
 env.setdefault("IK2_GATE_BF16", "1")
 env.setdefault("IK2_GATE_TILE", "64")
+env.setdefault("IK2_GATE_FUSE", "16")   # (the scripts' default; IK2_GATE_FUSE=0 for version 1.2.0's path)
 env.pop("HIP_VISIBLE_DEVICES", None)
 env["PATH"] = os.path.join(sys.prefix, "Lib", "site-packages", "_rocm_sdk_devel", "bin") + os.pathsep + env["PATH"]
 idx = subprocess.run([sys.executable, str(here / "hip_gpu_index.py"), a.gpu], env=env, capture_output=True, text=True)

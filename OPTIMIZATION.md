@@ -61,6 +61,7 @@ and dividing the difference by the number of visits.
 | Warm-up at load: buffers at full size and first kernel launches (first prompt only) | 1,557 -> 2,248 (511) | 910 -> 1,058 |
 | Expert inputs read in place; fused projections written to their final place | 3,457 -> 3,490 (4K) | 1,355 -> 1,382 |
 | Relative-position bias computed in the attention kernel instead of a table (8060S only; same tokens) | 3,615 -> 3,387: not used | 1,426 -> 1,621 (4K), 1,236 -> 1,368 (32K) |
+| Loop gates: both down products and the mix in one kernel, input and message read once (1.3.0) | 3,444 -> 3,556 (4K), 3,287 -> 3,348 (32K) | 1,564 -> 1,672, 1,268 -> 1,295 |
 | Prompt chunks of 4,096 tokens instead of 2,048 (a setting) | 3,539 -> 3,802 (4K), 3,279 -> 3,493 (32K) | 1,420 -> 1,485, 1,214 -> 1,272 |
 
 The prompt attention adds a learned bias that depends on the distance between query and key. It was computed as a separate
@@ -91,6 +92,11 @@ the warm-up removes from the first prompt.
 | Dense tiles of 256 weight rows (8060S, 4K) | 1,678 vs 1,705 |
 | Loop gates as BF16, convs and combine with batched loads in the prompt (8060S, 4K) | 1,410-1,423 vs 1,402, tokens differ |
 | Prompt attention with one lane per query (`IK2_FLASH2`), XT | 3,084 -> 3,023 |
+| Expert tiles of 64 rows on a 4-warp block for experts with few rows | XT 2,186 -> 1,991 (511), 8060S 1,126 -> 993 |
+| Expert tiles of 256 rows on 16 warps | XT 3,664 -> 3,618 (4K), 3,436 -> 3,378 (32K) |
+| Expert tiles with two shared-memory buffers (one barrier a step) | XT 3,682 -> 3,512 (4K), 8060S 1,668 -> 1,530 |
+| Expert kernel asking for 8 waves per SIMD | XT 3,674 -> 3,675, 8060S 1,675 -> 1,664 |
+| Loop gate up kernel over 32 or 64 tokens a block instead of 16 | XT 3,858 -> 3,821 / 3,797 (4K) |
 
 The lane-per-query attention is faster on the 8060S (1,382 -> 1,562 at 4K with a 2,048 chunk). Its tokens differ from the
 default kernel's, and on 4,032 reference positions it matched llama.cpp on 3,937 against 3,935 for the default, so it is

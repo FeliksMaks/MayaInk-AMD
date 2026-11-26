@@ -33,6 +33,10 @@ bool relb_rdna(const float* r, const float* proj, int rows, int extent, int K, f
 bool loop_gate_up_rdna(const float* x, const float* m, const float* g, const float* F, const float* G, int T, int C, int R,
                        float* y, cudaStream_t s);
 /// Y [T][ldy] = X [T][K] . W^T, F32, W(n, k) = W[n ldn + k ldk] (one of them 1); false: not taken (the BLAS's)
+bool loop_gate_down_rdna(const float* x, const float* m, const float* D, int T, int C, int R, float* a1, float* a2,
+                         cudaStream_t s);
+bool loop_gate_downmix_rdna(const float* x, const float* m, const float* D, int T, int C, int R, float eps,
+                            float* g, cudaStream_t s);
 bool gemm_f32_rdna(const float* X, int ldx, int T, const float* W, int N, int K, int ldn, int ldk, float* Y, int ldy,
                    cudaStream_t s);
 /// the most rows of a tile (32, or 128: IK2_RDNA_M128)

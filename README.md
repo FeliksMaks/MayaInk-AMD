@@ -20,6 +20,11 @@ One chat, every expert in VRAM, greedy decoding, FP16 KV cache, prompt chunk 4,0
 | Prompt, 4,095 tokens | 3,800 | 1,620 |
 | Prompt, 32,760 tokens | 3,490 | 1,370 |
 
+Version 1.3.0 against 1.2.0 in the same alternating runs (prompt tok/s): RX 7900 XT 3,444 -> 3,556 at 4K tokens and
+3,287 -> 3,348 at 32K; Radeon 8060S 1,564 -> 1,672 at 4K and 1,268 -> 1,295 at 32K. The table above is from earlier
+runs; the RX 7900 XT's speed moves by a few percent from one session to the next, which is why versions are compared
+within one run.
+
 For comparison, the same file with strata-inkling 0.1.67 on the RX 7900 XT: 2,030 tok/s prompt at 4,096 tokens and
 71 tok/s decode after it. The memory-bandwidth limit for decode is about 200 tok/s on the RX 7900 XT and 62 tok/s on the
 8060S (3.88 GB read per token).
@@ -91,6 +96,8 @@ used for text chat, one conversation at a time.
 | `--chunk N` | 2048 (4096 in the scripts) | Prompt tokens per pass. 4,096 is 4-8% faster than 2,048 and needs about 1.3 GB more VRAM. `serve.ps1` uses 4,096 up to a 48K context, 3,072 up to 64K and 2,048 above, because a full card gets slow: at 64K on 20 GB, 4,096 read 16K prompts at 2,480 tok/s against 3,460 with 2,048. |
 | `IK2_KV=fp8` (`-Fp8Kv`) | FP16 | Half the KV memory, and faster decode at long contexts. On the long reference it scored 94 of 96 on the prompt path, against 95 of 96 for FP16. |
 | `IK2_GATE_BF16=1`, `IK2_GATE_TILE=64` | set by the scripts | Loop-gate weights read as BF16 (they hold exact BF16 values), 64 channels a block. |
+| `IK2_GATE_FUSE=16` (`-NoGateFuse` turns it off) | set by the scripts | The loop gates' down products and mix in one pass, 16 tokens a block (`=1`: 32). Prompts 2-7% faster; another summing order, so some tokens differ from 1.2.0, with the same reference agreement. |
+| `IK2_GATE_DOWN=1` | 0 | Only the loop gates' two down products in one kernel. Superseded by `IK2_GATE_FUSE`. |
 | `IK2_FLASH_INL1=0` / `1` | 1 on the 8060S, 0 on the RX 7900 XT | Prompt attention computes its relative-position bias itself instead of reading a precomputed table. Same tokens either way; faster on the 8060S, slower on the RX 7900 XT. |
 | `IK2_FLASH2=4` | 0 | Prompt attention with one lane per query: faster prompts on the 8060S, no gain on the RX 7900 XT. Its tokens differ from the default; its agreement with the reference is the same (BENCHMARKS.md). |
 | `IK2_PRIME=0` | 1 | No warm-up at load (0.4 s). The first prompt then pays for buffer growth and first kernel launches. |

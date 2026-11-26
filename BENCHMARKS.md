@@ -20,6 +20,21 @@
 
 Prompt chunk 4,096. Decode is over 200-400 generated tokens.
 
+### Loop gates in one pass (1.3.0)
+
+`IK2_GATE_FUSE=16` against 1.2.0, chunk 4,096, 3 alternating rounds, 128 generated tokens, prompt tok/s (medians):
+
+| Prompt | XT 1.2.0 | XT 1.3.0 | 8060S 1.2.0 | 8060S 1.3.0 |
+|---|---|---|---|---|
+| 511 | 2,142 | 2,066 | 1,070 | 1,080 |
+| 4,095 | 3,444 | 3,556 | 1,564 | 1,672 |
+| 32,760 | 3,287 | 3,348 | 1,268 | 1,295 |
+
+Decode after the prompt is the same within noise (XT 103.6 / 101.6 at 4K, 89.7 / 89.5 at 32K; 8060S 43.8 / 43.8 at 4K, 34.6 / 34.9 at 32K). At
+511 tokens the XT's spread is larger than the difference (1,860-2,078 for 1.3.0). The generated tokens first differ at
+positions 16-65, as expected from another summing order. Reference agreement with `IK2_GATE_FUSE=16`, both GPUs: 188/188
+and 192/192 short, 93/94 and 95/96 long, no hard miss (the same as 1.2.0).
+
 ### Decode before and after the latency work
 
 | Prompt | XT before | XT after | 8060S before | 8060S after |

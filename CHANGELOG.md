@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.0 - 2026-11-26
+
+- The looped layers' message gates compute their two down products and their mix in one kernel, reading the layer's
+  input and message once instead of twice (`IK2_GATE_FUSE=16`, on in the scripts). Prompt reading, against 1.2.0 in the
+  same alternating runs: RX 7900 XT 3,444 -> 3,556 tok/s at 4K tokens (+3.3%), 3,287 -> 3,348 at 32K (+1.9%); Radeon 8060S
+  1,564 -> 1,672 at 4K (+6.9%), 1,268 -> 1,295 at 32K (+2.1%). Decode is unchanged. The sums run in another order, so
+  some generated tokens differ from 1.2.0; the agreement with the llama.cpp reference is the same (188/188 and 192/192
+  short, 93/94 and 95/96 long, on both GPUs). `-NoGateFuse` in `run.ps1` and `serve.ps1` gives 1.2.0's exact output.
+- `IK2_GATE_DOWN=1`: only the two down products in one kernel (the mix stays separate), an intermediate step kept as an
+  option.
+
 ## 1.2.0 - 2026-11-26
 
 - Radeon 8060S: the prompt attention computes its relative-position bias itself instead of reading a precomputed table.

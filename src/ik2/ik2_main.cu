@@ -1471,12 +1471,18 @@ void loop_gates_chunk(Work& W, const k::LoopGate* gt, int n, int T, int C, int R
     static const int skip = 0;   // (a timing probe of the development build, off here)
     if (skip & 4) return;
     for (int j = 0; j < n; ++j) {
-        // a1 [T][R] = x D_x^T, a2 = m D_m^T (D [R][2 C]: its rows' halves)
-        if (!(skip & 1) && !k::gemm_f32_rdna(gt[j].x, C, T, gt[j].D, R, C, 2 * C, 1, a1, R, g_s))
-        CB(cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, R, T, C, &one, gt[j].D, 2 * C, gt[j].x, C, &zero, a1, R));
-        if (!(skip & 1) && !k::gemm_f32_rdna(gt[j].m, C, T, gt[j].D + C, R, C, 2 * C, 1, a2, R, g_s))
-        CB(cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, R, T, C, &one, gt[j].D + C, 2 * C, gt[j].m, C, &zero, a2, R));
-        k::loop_gate_mix(gt[j].x, gt[j].m, a1, a2, T, C, R, eps, g, g_s);
+        // g in one pass (IK2_GATE_FUSE); else the down products, then the mix
+        const bool fused = !(skip & 1) && k::loop_gate_downmix_rdna(gt[j].x, gt[j].m, gt[j].D, T, C, R, eps, g, g_s);
+        if (!fused) {
+            // a1 [T][R] = x D_x^T, a2 = m D_m^T (D [R][2 C]: its rows' halves)
+            if (!(skip & 1) && !k::loop_gate_down_rdna(gt[j].x, gt[j].m, gt[j].D, T, C, R, a1, a2, g_s)) {
+                if (!(skip & 1) && !k::gemm_f32_rdna(gt[j].x, C, T, gt[j].D, R, C, 2 * C, 1, a1, R, g_s))
+                CB(cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, R, T, C, &one, gt[j].D, 2 * C, gt[j].x, C, &zero, a1, R));
+                if (!(skip & 1) && !k::gemm_f32_rdna(gt[j].m, C, T, gt[j].D + C, R, C, 2 * C, 1, a2, R, g_s))
+                CB(cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, R, T, C, &one, gt[j].D + C, 2 * C, gt[j].m, C, &zero, a2, R));
+            }
+            k::loop_gate_mix(gt[j].x, gt[j].m, a1, a2, T, C, R, eps, g, g_s);
+        }
         if (k::loop_gate_up_rdna(gt[j].x, gt[j].m, g, gt[j].F, gt[j].G, T, C, R, gt[j].y, g_s)) continue;
         // f [T][C] = g F, gn = g G (F, G [R][C])
         if (!(skip & 2) && !k::gemm_f32_rdna(g, R, T, gt[j].F, C, R, 1, C, f, C, g_s))

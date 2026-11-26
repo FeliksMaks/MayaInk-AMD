@@ -1516,6 +1516,181 @@ __global__ void __launch_bounds__(256) gemm_f32_kernel(const float* __restrict__
         if (tt + i < nt)
             *(float4*) (Y + (size_t) (t0 + tt + i) * ldy + n0 + nn) = make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
 }
+// a looped layer's gate down products for a chunk: a1 [T][64] = x D_x^T and a2 = m D_m^T
+// (D [64][2 C]: x's half, then m's), one launch for both (blockIdx.y), 32 tokens x 64 outputs a block of 128 threads,
+// 4 x 4 a thread; each output one F32 sum in k order
+constexpr int kGdT = 32, kGdK = 32, kGdLd = kGdK + 4;
+typedef float gd_f4 __attribute__((ext_vector_type(4)));   // (a native vector: stays in registers across the loop)
+__global__ void __launch_bounds__(128) loop_gate_down_kernel(const float* __restrict__ x, const float* __restrict__ m,
+                                                             const float* __restrict__ D, int T, int C,
+                                                             float* __restrict__ a1, float* __restrict__ a2) {
+    __shared__ __align__(16) float Xs[kGdT * kGdLd];
+    __shared__ __align__(16) float Ds[64 * kGdLd];
+    const int tid = threadIdx.x, z = blockIdx.y, t0 = blockIdx.x * kGdT;
+    const float* src = z ? m : x;
+    float* out = z ? a2 : a1;
+    const int o = tid & 15, tg = tid >> 4;   // (outputs o + 16 j, tokens t0 + 4 tg + i)
+    const int lr = tid >> 3, lc = (tid & 7) * 4;   // (the loads: rows lr, lr + 16 of x's tile, lr + 16 q of D's)
+    const float* xs0 = src + (size_t) min(t0 + lr, T - 1) * C + lc;
+    const float* xs1 = src + (size_t) min(t0 + lr + 16, T - 1) * C + lc;
+    const float* dp = D + (z ? C : 0) + (size_t) lr * 2 * C + lc;
+    const size_t d16 = (size_t) 16 * 2 * C;
+    float acc[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+    gd_f4 xv0 = *(const gd_f4*) xs0, xv1 = *(const gd_f4*) xs1;
+    gd_f4 dv0 = *(const gd_f4*) dp, dv1 = *(const gd_f4*) (dp + d16), dv2 = *(const gd_f4*) (dp + 2 * d16),
+          dv3 = *(const gd_f4*) (dp + 3 * d16);
+    for (int k0 = 0; k0 < C; k0 += kGdK) {
+        __syncthreads();
+        *(gd_f4*) (Xs + lr * kGdLd + lc) = xv0;
+        *(gd_f4*) (Xs + (lr + 16) * kGdLd + lc) = xv1;
+        *(gd_f4*) (Ds + lr * kGdLd + lc) = dv0;
+        *(gd_f4*) (Ds + (lr + 16) * kGdLd + lc) = dv1;
+        *(gd_f4*) (Ds + (lr + 32) * kGdLd + lc) = dv2;
+        *(gd_f4*) (Ds + (lr + 48) * kGdLd + lc) = dv3;
+        __syncthreads();
+        {
+            const int kn = min(k0 + kGdK, C - kGdK);   // (the last step reads its own block again: no branch)
+            xv0 = *(const gd_f4*) (xs0 + kn), xv1 = *(const gd_f4*) (xs1 + kn);
+            dv0 = *(const gd_f4*) (dp + kn), dv1 = *(const gd_f4*) (dp + d16 + kn);
+            dv2 = *(const gd_f4*) (dp + 2 * d16 + kn), dv3 = *(const gd_f4*) (dp + 3 * d16 + kn);
+        }
+#pragma unroll
+        for (int k = 0; k < kGdK; k += 4) {
+            float a[4][4], b[4][4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const gd_f4 v = *(const gd_f4*) (Xs + (4 * tg + i) * kGdLd + k);
+                a[i][0] = v.x, a[i][1] = v.y, a[i][2] = v.z, a[i][3] = v.w;
+            }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const gd_f4 v = *(const gd_f4*) (Ds + (o + 16 * j) * kGdLd + k);
+                b[j][0] = v.x, b[j][1] = v.y, b[j][2] = v.z, b[j][3] = v.w;
+            }
+#pragma unroll
+            for (int q = 0; q < 4; ++q)
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(a[i][q], b[j][q], acc[i][j]);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int t = t0 + 4 * tg + i;
+        if (t < T)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) out[(size_t) t * 64 + o + 16 * j] = acc[i][j];
+    }
+}
+bool loop_gate_down_rdna(const float* x, const float* m, const float* D, int T, int C, int R, float* a1, float* a2,
+                         cudaStream_t s) {
+    static const bool on = std::getenv("IK2_GATE_DOWN") && std::atoi(std::getenv("IK2_GATE_DOWN"));
+    if (!on || R != 64 || T <= 0 || C % kGdK || (((uintptr_t) x | (uintptr_t) m | (uintptr_t) D) & 15)) return false;
+    loop_gate_down_kernel<<<dim3((unsigned) ((T + kGdT - 1) / kGdT), 2u), 128, 0, s>>>(x, m, D, T, C, a1, a2);
+    check("loop_gate_down_rdna");
+    return true;
+}
+// the gate's down products and its mix in one kernel: a block of NT tokens (16 or 32) runs x's half,
+// then m's, with each row's sum of squares taken from the loads it stages; g = a1 / rms(x) + a2 / rms(m)
+template <int NT>
+__global__ void __launch_bounds__(4 * NT) loop_gate_downmix_kernel(const float* __restrict__ x, const float* __restrict__ m,
+                                                                const float* __restrict__ D, int T, int C, float eps,
+                                                                float* __restrict__ g) {
+    constexpr int RP = NT / 2, ND = 64 / RP;   // (rows a load pass; D's passes)
+    __shared__ __align__(16) float Xs[NT * kGdLd];
+    __shared__ __align__(16) float Ds[64 * kGdLd];
+    __shared__ float rs[2][NT];
+    const int tid = threadIdx.x, t0 = blockIdx.x * NT;
+    const int o = tid & 15, tg = tid >> 4;
+    const int lr = tid >> 3, lc = (tid & 7) * 4;
+    const size_t d16 = (size_t) RP * 2 * C;
+    float ax[4][4], acc[4][4];
+#pragma unroll 1
+    for (int z = 0; z < 2; ++z) {
+        const float* src = z ? m : x;
+        const float* xs0 = src + (size_t) min(t0 + lr, T - 1) * C + lc;
+        const float* xs1 = src + (size_t) min(t0 + lr + RP, T - 1) * C + lc;
+        const float* dp = D + (z ? C : 0) + (size_t) lr * 2 * C + lc;
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+        float sq0 = 0.0f, sq1 = 0.0f;
+        gd_f4 xv0 = *(const gd_f4*) xs0, xv1 = *(const gd_f4*) xs1;
+        gd_f4 dv[ND];
+#pragma unroll
+        for (int p = 0; p < ND; ++p) dv[p] = *(const gd_f4*) (dp + p * d16);
+        for (int k0 = 0; k0 < C; k0 += kGdK) {
+            __syncthreads();
+            *(gd_f4*) (Xs + lr * kGdLd + lc) = xv0;
+            *(gd_f4*) (Xs + (lr + RP) * kGdLd + lc) = xv1;
+#pragma unroll
+            for (int p = 0; p < ND; ++p) *(gd_f4*) (Ds + (lr + p * RP) * kGdLd + lc) = dv[p];
+            sq0 = fmaf(xv0.x, xv0.x, fmaf(xv0.y, xv0.y, fmaf(xv0.z, xv0.z, fmaf(xv0.w, xv0.w, sq0))));
+            sq1 = fmaf(xv1.x, xv1.x, fmaf(xv1.y, xv1.y, fmaf(xv1.z, xv1.z, fmaf(xv1.w, xv1.w, sq1))));
+            __syncthreads();
+            {
+                const int kn = min(k0 + kGdK, C - kGdK);
+                xv0 = *(const gd_f4*) (xs0 + kn), xv1 = *(const gd_f4*) (xs1 + kn);
+#pragma unroll
+                for (int p = 0; p < ND; ++p) dv[p] = *(const gd_f4*) (dp + p * d16 + kn);
+            }
+#pragma unroll
+            for (int k = 0; k < kGdK; k += 4) {
+                float a[4][4], b[4][4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const gd_f4 v = *(const gd_f4*) (Xs + (4 * tg + i) * kGdLd + k);
+                    a[i][0] = v.x, a[i][1] = v.y, a[i][2] = v.z, a[i][3] = v.w;
+                }
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const gd_f4 v = *(const gd_f4*) (Ds + (o + 16 * j) * kGdLd + k);
+                    b[j][0] = v.x, b[j][1] = v.y, b[j][2] = v.z, b[j][3] = v.w;
+                }
+#pragma unroll
+                for (int q = 0; q < 4; ++q)
+#pragma unroll
+                    for (int i = 0; i < 4; ++i)
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(a[i][q], b[j][q], acc[i][j]);
+            }
+        }
+        // a row's 8 loaders are 8 neighbouring lanes
+#pragma unroll
+        for (int s = 1; s < 8; s <<= 1) sq0 += __shfl_xor(sq0, s, 8), sq1 += __shfl_xor(sq1, s, 8);
+        if ((tid & 7) == 0) rs[z][lr] = sq0, rs[z][lr + RP] = sq1;
+        if (z == 0) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) ax[i][j] = acc[i][j];
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int r = 4 * tg + i, t = t0 + r;
+        const float rx = rsqrtf(rs[0][r] / (float) C + eps), rm = rsqrtf(rs[1][r] / (float) C + eps);
+        if (t < T)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) g[(size_t) t * 64 + o + 16 * j] = rx * ax[i][j] + rm * acc[i][j];
+    }
+}
+bool loop_gate_downmix_rdna(const float* x, const float* m, const float* D, int T, int C, int R, float eps, float* g,
+                            cudaStream_t s) {
+    static const int on = std::getenv("IK2_GATE_FUSE") ? std::atoi(std::getenv("IK2_GATE_FUSE")) : 0;   // (16: 16 tokens a block)
+    if (!on || R != 64 || T <= 0 || C % kGdK || (((uintptr_t) x | (uintptr_t) m | (uintptr_t) D) & 15)) return false;
+    if (on == 16) loop_gate_downmix_kernel<16><<<dim3((unsigned) ((T + 15) / 16)), 64, 0, s>>>(x, m, D, T, C, eps, g);
+    else loop_gate_downmix_kernel<32><<<dim3((unsigned) ((T + 31) / 32)), 128, 0, s>>>(x, m, D, T, C, eps, g);
+    check("loop_gate_downmix_rdna");
+    return true;
+}
 bool gemm_f32_rdna(const float* X, int ldx, int T, const float* W, int N, int K, int ldn, int ldk, float* Y, int ldy,
                    cudaStream_t s) {
     static const bool on = (std::getenv("IK2_GATE_GEMM") && std::atoi(std::getenv("IK2_GATE_GEMM"))) && rdna_wmma_gpu();
