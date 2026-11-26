@@ -1,0 +1,15 @@
+{
+  "id": "maya-ik2-rdna",
+  "engine": "maya-ik2-rdna",
+  "about": "maya-ik2 for AMD RDNA 3 / 3.5 (this repository) behind the maya-inkling-mini server; Inkling 2 Mini UD-IQ4_XS GGUF, OpenAI and Anthropic chat APIs",
+  "image": null,
+  "backend": "amd-rocm",
+  "os": "windows",
+  "rocm": "7.14.1",
+  "port": 18000,
+  "entrypoint": "serve.ps1",
+  "args": ["-Upstream", "${upstream}", "-Model", "/models/${name}/Inkling-2-Mini-UD-IQ4_XS.gguf", "-Gpu", "${gpu}",
+           "-Context", "${ctx}", "-Chunk", "${chunk}"],
+  "fp8_kv_arg": "-Fp8Kv",
+  "upstream": "https://github.com/alesha-pro/maya-inkling-mini@c520fd14de3b21d67ddc6b7e7348b761aad26d52"
+}

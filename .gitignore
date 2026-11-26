@@ -1,0 +1,6 @@
+.venv/
+build/
+scripts/tmp/
+__pycache__/
+*.log
+*.gguf

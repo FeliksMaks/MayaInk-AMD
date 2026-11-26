@@ -1,0 +1,1 @@
+{"model":"inkling-2-mini","weights":"unsloth/Inkling-2-Mini-GGUF@ae9327c5fbc7333116ba32eee78bb5d2bbefae4f","engine":"maya-ik2-rdna@v1.0.0","set":{"ctx":131072,"chunk":4096},"card":"radeon-8060s-64gb","proof":[]}

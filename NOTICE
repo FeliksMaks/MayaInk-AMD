@@ -1,0 +1,56 @@
+inkling2-mini-rdna3
+
+This repository contains code from the following projects.
+
+1. maya-inkling-mini (Project Maya fork with the maya-ik2 engine for Inkling 2 Mini)
+   https://github.com/alesha-pro/maya-inkling-mini, commit c520fd14de3b21d67ddc6b7e7348b761aad26d52
+   (Project Maya v1.1.70 with the Inkling 2 Mini engine)
+   Copyright (c) 2026 Peasant Smith and the Project Maya contributors
+   Copyright (c) 2026 Niko1221 and the Strata contributors
+   MIT License, see LICENSE.
+   Used: src/ik2/* except ik2_rdna.inc and ik2_hip.cuh (the engine: model arithmetic, GGUF loading, resident token
+   path, prompt path, drafter support, CPU helpers), include/strata/artifact/gguf_reader.hpp and
+   include/strata/hip_compat/*. Modified here for HIP on Windows, the UD-IQ4_XS weight formats and AMD kernels;
+   changes are marked "(AMD port)" in the source.
+   Not included, used at run time by serve.ps1: serve/ (the chat server), tools/strata_tokenizer.py and
+   tools/ik2/chat_template.jinja.
+
+2. Project Maya v1.1.74
+   https://github.com/mw00/project-maya (release v1.1.74)
+   Copyright (c) 2026 Peasant Smith and the Project Maya contributors; MIT License.
+   Used: include/strata/kernels/rdna_wmma.hpp (unchanged), and the first version of src/ik2/ik2_rdna.inc: the grouped
+   prompt experts in 32-row tiles (experts_rdna_kernel, experts_rdna_gu, experts_rdna_down, moe_rows_combine), the
+   prompt flash attention (attn_flash_rdna), gemm_bf16_cols and rdna_wmma_gpu. This repository extends that file
+   (larger tiles, more weight formats, dense products, loop gates, relative bias, decode attention).
+
+3. Strata (through Project Maya)
+   https://github.com/Niko1221/Strata
+   Copyright (c) 2026 Niko1221 and the Strata contributors; MIT License.
+   The include/strata/ headers originate in Strata.
+
+4. Inkling 2 Mini CIRU Halo Agent (gfx1151), version 1.5.0
+   https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151
+   Copyright 2026 Ciru (source headers: Copyright (c) 2026 CIRU AI)
+   Apache License, Version 2.0, see LICENSES/Apache-2.0.txt.
+   No code was copied. These kernels in src/ik2/ik2_rdna.inc follow designs from its HIP sources and are marked there:
+   - hip_moe_prefill.hip: expert tiles of 128 rows and of 256 weight columns, and skipping fragments past a tile's rows
+     (experts_rdna128_kernel, experts_rdna256_kernel);
+   - hip_glue_prefill.hip: the loop gate's up products and blend in one launch without intermediate matrices
+     (loop_gate_up_rdna);
+   - hip_attn_prefill.hip: prompt attention with one lane per query and the swapped products S^T = K Q^T, O^T = V^T P^T
+     (attn_flash2_rdna_kernel, IK2_FLASH2).
+   They were rewritten for this engine's data layouts, weight formats, FP16 arithmetic and Windows. No weights, fitted
+   files or other material of that project are included or used.
+   From that project's NOTICE: "Ciru's AMD runtime changes, fitted weight files and packaging are distributed under the
+   Apache License, Version 2.0."
+
+Used for testing only, not included:
+- llama.cpp (https://github.com/ggml-org/llama.cpp, MIT): its greedy output is the reference of scripts/gate.py and
+  scripts/reference.json.
+- AMD ROCm SDK 7.14.1 Python packages (https://repo.amd.com/rocm/whl-multi-arch): compiler, HIP runtime, hipBLAS.
+
+Model, not included:
+- Inkling 2 Mini by Thinking Machines Lab, Apache License 2.0, https://huggingface.co/thinkingmachines/Inkling-2-Mini
+- GGUF conversion by Unsloth, https://huggingface.co/unsloth/Inkling-2-Mini-GGUF
+  (Inkling-2-Mini-UD-IQ4_XS.gguf at revision ae9327c5fbc7333116ba32eee78bb5d2bbefae4f)
+- scripts/reference.json holds token ids and log-probabilities that llama.cpp produced from that model.
