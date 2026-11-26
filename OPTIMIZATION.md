@@ -23,6 +23,7 @@ instructions (`ik2_rdna.inc`).
 | A token's expert gate/up and down in one dispatch | 94.7 -> 95.6 | 44.1 -> 44.2 | same |
 | Router product with 24 loads in flight per lane | 93.5 -> 100.4 | measured with the next row | same |
 | The same for loop gates, attention sinks, MoE combine and attention merge | 99.7 -> 108.6 | 43.4 -> 47.4 | same |
+| FP8 cache: decode attention on the matrix cores, FP8 values turned into FP16 by moving their bits | 94.0 -> 103.2 (4K), 89.5 -> 95.5 (32K) | 42.4 -> 44.2, 37.6 -> 38.7 | differ; gate equal |
 
 The last two rows are the largest gain and the simplest change. A token runs several hundred small kernels, and many
 of them were loops of this form:
@@ -39,6 +40,11 @@ result bit for bit and removes most of the wait:
 for (int b = 0; b < 24; ++b) wv[b] = w[i + 32 * b], xv[b] = x[i + 32 * b];   // all loads issued
 for (int b = 0; b < 24; ++b) a += h2f(wv[b]) * xv[b];                          // same order of additions
 ```
+
+With an FP8 cache, decode attention had used the emulated tensor-core code. The FP8 values are now made FP16 in registers by
+moving their exponent and mantissa bits into place, which gives the exact value divided by 256 (subnormals included); the
+factor 256 is folded into the logit and value scales. A first version that converted each value in software was slower than
+the emulated kernel (37.4 -> 28.4 tok/s at 32K on the 8060S).
 
 Such kernels are found by comparing each kernel group's time with its bytes. Timing came from launching a group twice
 and dividing the difference by the number of visits.

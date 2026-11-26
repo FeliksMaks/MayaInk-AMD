@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.0 - 2026-11-26
+
+- FP8 KV cache: single-token attention runs on the matrix cores (WMMA), as with the FP16 cache. Decode with `-Fp8Kv` on an
+  RX 7900 XT: 94 -> 103 tok/s after 4K tokens, 90 -> 96 after 32K, 75 -> 81 after 95K. Radeon 8060S: 42 -> 44 and 38 -> 39.
+  `IK2_ATTN_WMMA8=0` selects the earlier kernel. The FP16 cache is unchanged.
+
 ## 1.0.0 - 2026-11-26
 
 First release.

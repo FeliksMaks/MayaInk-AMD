@@ -6935,9 +6935,17 @@ void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink
                 check("attn_pipe");
                 return;
             }
-            attn_decode_wmma_kernel<<<dim3((unsigned) Hkv, (unsigned) n_split), kWaNW * 32, 0, s>>>(
+            attn_decode_wmma_kernel<uint16_t><<<dim3((unsigned) Hkv, (unsigned) n_split), kWaNW * 32, 0, s>>>(
                 q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel, extent, window, n_split, o_part, ml_part);
             done = true;
+        }
+    } else {   // (an FP8 cache: the same kernel, its values made FP16 in registers; IK2_ATTN_WMMA8=0: the emulated one)
+        static const bool wm8 = wm && !(getenv("IK2_ATTN_WMMA8") && !atoi(getenv("IK2_ATTN_WMMA8")));
+        if (wm8 && H / Hkv <= 4 && rel4 && (((uintptr_t) kc | (uintptr_t) vc | (uintptr_t) q16) & 15) == 0) {
+            attn_decode_wmma_kernel<uint8_t><<<dim3((unsigned) Hkv, (unsigned) n_split), kWaNW * 32, 0, s>>>(
+                q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel, extent, window, n_split, o_part, ml_part);
+            done = true;
+            v_inv *= 256.0f;   // (V is / 256 there)
         }
     }
     if (!done)

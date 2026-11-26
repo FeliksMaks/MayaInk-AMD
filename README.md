@@ -81,7 +81,7 @@ The first start writes the tokenizer files to `build\tokenizer`. The server list
 .\serve.ps1 -Upstream C:\src\maya-inkling-mini -Model C:\models\Inkling-2-Mini-UD-IQ4_XS.gguf -Context 131072 -Fp8Kv
 ```
 
-On an RX 7900 XT a 95,000-token prompt took 40 s with this setting, and decode after it ran at 75 tok/s. The server is
+On an RX 7900 XT a 95,000-token prompt took 39 s with this setting, and decode after it ran at 81 tok/s. The server is
 used for text chat, one conversation at a time.
 
 ## Settings
@@ -89,7 +89,7 @@ used for text chat, one conversation at a time.
 | Setting | Default | Effect |
 |---|---|---|
 | `--chunk N` | 2048 (4096 in the scripts) | Prompt tokens per pass. 4,096 is 4-8% faster than 2,048 and needs about 1.3 GB more VRAM. `serve.ps1` uses 4,096 up to a 48K context, 3,072 up to 64K and 2,048 above, because a full card gets slow: at 64K on 20 GB, 4,096 read 16K prompts at 2,480 tok/s against 3,460 with 2,048. |
-| `IK2_KV=fp8` (`-Fp8Kv`) | FP16 | Half the KV memory. On an earlier build it scored 94 of 96 on the long reference, against 95 of 96 for FP16. |
+| `IK2_KV=fp8` (`-Fp8Kv`) | FP16 | Half the KV memory, and faster decode at long contexts. On the long reference it scored 94 of 96 on the prompt path, against 95 of 96 for FP16. |
 | `IK2_GATE_BF16=1`, `IK2_GATE_TILE=64` | set by the scripts | Loop-gate weights read as BF16 (they hold exact BF16 values), 64 channels a block. |
 | `IK2_FLASH2=4` | 0 | Prompt attention with one lane per query: 9-15% faster prompts on the 8060S, no gain on the RX 7900 XT. Its tokens differ from the default; its agreement with the reference is the same (BENCHMARKS.md). |
 | `IK2_PRIME=0` | 1 | No warm-up at load (0.4 s). The first prompt then pays for buffer growth and first kernel launches. |
@@ -97,6 +97,7 @@ used for text chat, one conversation at a time.
 | `IK2_RDNA_MIX=0` | 1 | The prompt runs layers 20-23 one expert at a time. |
 | `IK2_NOGATHER=0`, `IK2_NOUNPACK=0` | 1 | Copy expert inputs together, and fused projections apart, in separate passes. |
 | `IK2_ATTN_WMMA=0`, `IK2_ROUTER_FAST=0` | 1 | Earlier decode attention and router kernels. |
+| `IK2_ATTN_WMMA8=0` | 1 | With an FP8 cache, the earlier decode attention kernel. |
 
 `IK2_PIPE` assumes that the blocks of one dispatch start in order. Its wait is bounded and writes NaN if that assumption
 fails, so a failure is visible rather than a hang.

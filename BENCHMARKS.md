@@ -57,6 +57,18 @@ XT at a 64K context. On the 8060S the generated tokens are the same; on the XT t
 
 Run-to-run spread on the XT reached 20% for 128-511-token prompts; differences of a few percent there are noise.
 
+### FP8 cache
+
+Decode with `IK2_KV=fp8` (chunk 2,048, context 131,072 on the XT), before and after the matrix-core FP8 attention, 2 rounds:
+
+| Prompt | XT before | XT after | 8060S before | 8060S after |
+|---|---|---|---|---|
+| 4,095 | 94.0 | 103.2 | 42.4 | 44.2 |
+| 32,760 | 89.5 | 95.5 | 37.6 | 38.7 |
+
+In a server on the XT with a 131,072-token context: decode after a 12,628-token prompt 99.9 tok/s (before 89.6), after a
+95,029-token prompt 81.5 tok/s (before 75.0). The FP16 cache's tokens and speed are unchanged.
+
 ## Other engines
 
 Same GGUF and FP16 KV cache, each engine's own benchmark command, so differences of a few percent are not meaningful.
@@ -82,5 +94,9 @@ Prompt chunk 4,096 gives the same scores. On 41 further prompts of 1-3K tokens (
 prompt path matched 3,838 with chunk 4,096 and 3,840 with chunk 2,048. With `IK2_FLASH2=4` the 8060S matched 3,937 of
 4,032 positions against 3,935 for the default kernel. No hard miss anywhere: every miss is a position where llama.cpp's
 own top two tokens are within 0.5 logit.
+
+With the FP8 cache (XT): short reference 186/188 single-token and 190/192 prompt, long reference 92/94 and 94/96; on 41
+further prompts the prompt path matched 3,811 of 3,936 with one hard miss. The matrix-core FP8 attention against the earlier
+FP8 kernel, single-token path: 187 against 186 of 188, 94 against 92 of 94, and 828 against 829 of 855 on nine further prompts.
 
 This check compares top-1 tokens at a few thousand positions. It is not a perplexity or task benchmark.

@@ -1113,8 +1113,25 @@ __device__ __forceinline__ float rl_f(float v, int lane) {
     return __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(uint32_t, v), lane));
 }
 #if defined(MAYA_RDNA_WMMA)
-__device__ __forceinline__ void attn_wmma_part(const uint16_t* __restrict__ q16, const uint16_t* __restrict__ kc,
-                                               const uint16_t* __restrict__ vc, int kv_cap, int H, int Hkv, const int* pos_d,
+// two E4M3 values (bytes 0, 1 of x) as FP16 / 256 (exact: the exponent and mantissa bits land in the FP16's; NaN is never stored)
+__device__ __forceinline__ uint32_t e4m3x2_h2_div256(uint32_t x) {
+    x = (x & 0xFFu) | ((x & 0xFF00u) << 8);
+    return ((x & 0x007F007Fu) << 7) | ((x & 0x00800080u) << 8);
+}
+// 16 E4M3 values as FP16 / 256 (a K row's 16 dims)
+__device__ __forceinline__ maya::kernels::wmma_h16 rm_frag8(const uint8_t* p) {
+    const uint4 q = *(const uint4*) p;
+    const uint32_t w[4] = {q.x, q.y, q.z, q.w};
+    uint32_t h[8];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) h[2 * i] = e4m3x2_h2_div256(w[i]), h[2 * i + 1] = e4m3x2_h2_div256(w[i] >> 16);
+    maya::kernels::wmma_h16 r;
+    __builtin_memcpy(&r, h, sizeof r);
+    return r;
+}
+template <class KVT>
+__device__ __forceinline__ void attn_wmma_part(const uint16_t* __restrict__ q16, const KVT* __restrict__ kc,
+                                               const KVT* __restrict__ vc, int kv_cap, int H, int Hkv, const int* pos_d,
                                                int qpos, float qk_scale, const float* __restrict__ r,
                                                const float* __restrict__ proj, int d_rel, int extent, int window, int n_split,
                                                float* __restrict__ o_part, float2* __restrict__ ml_part, int bx, int by) {
@@ -1140,9 +1157,9 @@ __device__ __forceinline__ void attn_wmma_part(const uint16_t* __restrict__ q16,
 #pragma unroll
         for (int d = 0; d < 4; ++d) o[h][d] = 0.0f;
     }
-    const float sc = qk_scale * kLog2e;
-    const uint16_t* kg = kc + (size_t) g * kFaD;
-    const uint16_t* vg = vc + (size_t) g * kFaD + lane * 4;
+    const float sc = qk_scale * kLog2e * (sizeof(KVT) == 1 ? 256.0f : 1.0f);   // (FP8: K is / 256)
+    const KVT* kg = kc + (size_t) g * kFaD;
+    const KVT* vg = vc + (size_t) g * kFaD + lane * 4;
     const float* rr[2] = {r + (size_t) (g * R + (hok[0] ? hd[0] : 0)) * d_rel, r + (size_t) (g * R + (hok[1] ? hd[1] : 0)) * d_rel};
     for (int st = st0; st < st1; ++st) {
         const int kt = k_lo + st * 16, kmax = qpos - kt;
@@ -1153,13 +1170,23 @@ __device__ __forceinline__ void attn_wmma_part(const uint16_t* __restrict__ q16,
             return (size_t) rw * KD;
         };
         const int key = kt + ln, dist = qpos - key;
-        const uint16_t* kp = kg + row(ln);
+        const KVT* kp = kg + row(ln);
         wmma_h16 kf[kFaD / 16];
 #pragma unroll
-        for (int kk = 0; kk < kFaD / 16; ++kk) kf[kk] = rm_frag(kp + kk * 16);
+        for (int kk = 0; kk < kFaD / 16; ++kk) {
+            if constexpr (sizeof(KVT) == 1) kf[kk] = rm_frag8(kp + kk * 16);
+            else kf[kk] = rm_frag(kp + kk * 16);
+        }
         uint2 vv[16];   // (the V rows' 4 dims asked for with the keys)
 #pragma unroll
-        for (int k = 0; k < 16; ++k) vv[k] = *(const uint2*) (vg + row(k));
+        for (int k = 0; k < 16; ++k) {
+            if constexpr (sizeof(KVT) == 1) {
+                const uint32_t q = *(const uint32_t*) (vg + row(k));
+                vv[k] = make_uint2(e4m3x2_h2_div256(q), e4m3x2_h2_div256(q >> 16));
+            } else {
+                vv[k] = *(const uint2*) (vg + row(k));
+            }
+        }
         const bool near = dist >= 0 && dist < extent;
         float b[2] = {0.0f, 0.0f};
         if (qpos - (kt + 15) < extent) {
@@ -1236,8 +1263,9 @@ __device__ __forceinline__ void attn_wmma_part(const uint16_t* __restrict__ q16,
     }
 }
 #endif
+template <class KVT>
 __global__ void __launch_bounds__(kWaNW * 32)
-attn_decode_wmma_kernel(const uint16_t* __restrict__ q16, const uint16_t* __restrict__ kc, const uint16_t* __restrict__ vc,
+attn_decode_wmma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__ kc, const KVT* __restrict__ vc,
                         int kv_cap, int H, int Hkv, const int* pos_d, int qpos, float qk_scale,
                         const float* __restrict__ r, const float* __restrict__ proj, int d_rel, int extent, int window,
                         int n_split, float* __restrict__ o_part, float2* __restrict__ ml_part) {
