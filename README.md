@@ -33,6 +33,21 @@ For comparison, the same file with strata-inkling 0.1.67 on the RX 7900 XT: 2,03
 The engine's top-1 tokens match llama.cpp's greedy reference on 188 of 188 single-token steps and 192 of 192 prompt
 positions (short prompts), and on 93 of 94 and 95 of 96 positions of two long prompts. Every miss is a near tie.
 
+## Progress, 1.0 to 1.4
+
+Each release was measured against the one before it in the same alternating runs and checked against the llama.cpp
+reference before it was published.
+
+| Version | Change | Measured effect |
+|---|---|---|
+| 1.0.0 | First release: matrix-core prompt kernels, batched single-token path | RX 7900 XT 109 tok/s decode, 3,800 tok/s prompt at 4K; Radeon 8060S 47 / 1,485 |
+| 1.1.0 | FP8 KV cache: decode attention on the matrix cores | With `-Fp8Kv` on the RX 7900 XT: 94 -> 103 tok/s after 4K tokens, 75 -> 81 after 95K |
+| 1.2.0 | 8060S: relative bias computed inside the prompt attention | 8060S prompt 1,426 -> 1,621 tok/s at 4K, 1,236 -> 1,368 at 32K |
+| 1.3.0 | Loop gates' down products and mix in one pass | Prompt at 4K: RX 7900 XT +3.3%, 8060S +6.9% |
+| 1.4.0 | ISTA-DASLab's GSQ-RCO file; its dense weights as Q8_0, compiled IQ3_XXS / IQ4_NL expert kernels | GSQ decode RX 7900 XT 65 -> 103 tok/s, 8060S 34 -> 43; RX 7800 XT 16 GB: 83 tok/s |
+
+For reference, the same UD file on strata-inkling 0.1.67 (RX 7900 XT): 2,030 tok/s prompt at 4K and 71 tok/s decode.
+
 ## Two GGUF files
 
 Since 1.4.0 the engine also runs ISTA-DASLab's
@@ -50,6 +65,11 @@ GSQ-RCO file with 1.4.0, same settings as above, medians of 3 alternating runs (
 | Prompt, 511 tokens | 1,840 | |
 | Prompt, 4,095 tokens | 3,210 | 1,520 |
 | Prompt, 32,760 tokens | 2,870 | |
+
+On a 16 GB RX 7800 XT (`gfx1101`) only the GSQ file fits in VRAM: 82.9 tok/s decode with a short prompt, 77.8 after
+4,095 tokens, 2,510 tok/s prompt at 4K. The UD file's 13.1 GiB of experts do not fit beside the rest, so they are read
+from system memory through a VRAM cache: about 7 tok/s (one run). The smaller file's gain is that it fits, not that it
+reads fewer bytes.
 
 Its top-1 tokens match llama.cpp b12720's greedy reference on 186 of 188 single-token steps and 188 of 192 prompt
 positions (short prompts), and 93 of 94 and 95 of 96 on the long ones; every miss is a near tie.
@@ -73,7 +93,8 @@ earlier engine exactly. Load takes about 10 s longer with the conversion.
 
 ## Requirements
 
-- Windows 11 and a `gfx1100` (RX 7900 series) or `gfx1151` (Radeon 8060S) GPU. The build also includes `gfx1101`.
+- Windows 11 and a `gfx1100` (RX 7900 series), `gfx1101` (RX 7800 / 7700 XT, tested on an RX 7800 XT with the GSQ file)
+  or `gfx1151` (Radeon 8060S) GPU.
 - VRAM: 13.1 GiB of experts and 1.0 GiB of dense weights, plus the KV cache (32 KB a token in FP16, 16 KB in FP8).
   On a 20 GB card: up to 64K tokens with the FP16 cache, up to 128K with `-Fp8Kv`.
 - Visual Studio 2022 Build Tools with the C++ workload. Visual Studio 18 does not work: ROCm 7.14.1's compiler rejects
@@ -94,7 +115,8 @@ python -m venv .venv
 .\build.ps1 -Arch gfx1100
 ```
 
-For the 8060S install `device-gfx1151` and use `-Arch gfx1151`. With both device packages, `-Arch "gfx1100;gfx1151"`
+For the 8060S install `device-gfx1151` and use `-Arch gfx1151`; for an RX 7800 XT or 7700 XT, `device-gfx1101` and
+`-Arch gfx1101` (the run needs that package's rocBLAS kernels too). With both device packages, `-Arch "gfx1100;gfx1151"`
 builds one binary for both. The output is `build\maya-ik2.exe`.
 
 ## Run from the command line

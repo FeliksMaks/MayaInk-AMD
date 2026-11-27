@@ -13,6 +13,8 @@
   same agreement with the llama.cpp reference within near ties; `IK2_REQ8=0` keeps the file's weights (77 tok/s on the
   RX 7900 XT). `scripts/reference-gsq.json` is the reference for that file.
 - The UD-IQ4_XS file gives the same tokens and speed as 1.3.0.
+- Tested on an RX 7800 XT 16 GB (`gfx1101`) with the GSQ file: 83 tok/s decode, 2,508 tok/s prompt at 4K. The UD
+  file does not fit there with every expert in VRAM.
 
 ## 1.3.0 - 2026-11-26
 

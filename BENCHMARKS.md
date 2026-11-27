@@ -32,6 +32,17 @@ tok/s). Default (`IK2_REQ8=1` for this file) against `IK2_REQ8=0` (the file's de
 | 4,095 | 3,206 | 96.2 | 73.1 | 1,524 | 41.4 | 36.3 |
 | 32,760 | 2,868 | 84.7 | 65.7 | | | |
 
+RX 7800 XT 16 GB (`gfx1101`), the same settings with a 8,192-token context:
+
+| Prompt | Prompt tok/s | Decode | Decode, `IK2_REQ8=0` |
+|---|---|---|---|
+| 27 | - | 82.9 | 60.9 |
+| 511 | 1,393 | 81.9 | 60.4 |
+| 4,095 | 2,508 | 77.8 | 58.3 |
+
+The UD-IQ4_XS file does not fit on this card with every expert in VRAM; with its experts read from system memory
+through a VRAM cache it decoded 6.8 tok/s (one run, 74% of expert reads served from the cache).
+
 Before 1.4.0's token kernels (the same file, the general expert path, no conversion), decode with a short prompt was
 65 tok/s on the XT and 34 on the 8060S. Prompt speed is about the same with and without the conversion (XT at 4K:
 3,206 against 3,539 in this run, 3,000 against 3,129 in an earlier one; at 32K 2,868 against 2,870).
