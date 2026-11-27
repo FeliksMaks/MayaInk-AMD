@@ -449,6 +449,31 @@ template <class T> T* kv_alloc(size_t n, bool sliding) {
     CU(cudaMallocManaged(&ptr, n * sizeof(T)));
     return ptr;
 }
+
+// (AMD port) IK2_REQ8=1: dense matrices of other block types (GSQ-RCO's K-quants, BF16) requantized to Q8_0 on the
+// host at load (ggml's quantize_row_q8_0), so they take the planar Q8_0 token path - values change (<0.5% a value)
+static bool g_req8 = getenv("IK2_REQ8") && atoi(getenv("IK2_REQ8"));   // (on by default for GSQ-RCO files: below)
+static uint16_t f32_to_f16_bits(float f) {
+    __half h = __float2half_rn(f);
+    uint16_t b;
+    std::memcpy(&b, &h, 2);
+    return b;
+}
+std::vector<uint8_t> q8_blocks_of(const std::vector<float>& v) {
+    std::vector<uint8_t> o(v.size() / 32 * 34);
+    for (size_t b = 0; b < v.size() / 32; ++b) {
+        const float* x = v.data() + b * 32;
+        float amax = 0.0f;
+        for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(x[j]));
+        const float d = amax / 127.0f, id = d ? 1.0f / d : 0.0f;
+        uint8_t* p = o.data() + b * 34;
+        const uint16_t db = f32_to_f16_bits(d);
+        std::memcpy(p, &db, 2);
+        for (int j = 0; j < 32; ++j) p[2 + j] = (uint8_t) (int8_t) std::lround(x[j] * id);
+    }
+    return o;
+}
+std::vector<float> host_f32(const Shards& S, const std::string& n, size_t expect);
 // Q8_0 blocks (2 bytes of FP16 scale, 32 int8 values) taken apart into m.q8 / m.q8d on the device; false if the
 // matrix cannot be kept so (another type, or K not a multiple of 128)
 bool upload_planar(Mat& m, const std::vector<const uint8_t*>& parts, const std::vector<size_t>& part_values) {
@@ -472,10 +497,24 @@ bool upload_planar(Mat& m, const std::vector<const uint8_t*>& parts, const std::
     return true;
 }
 
+uint16_t* dev_f16(const std::vector<float>& v);
+
 Mat load_mat(const Shards& S, const std::string& n, int N, int Kd) {
     const auto* t = S.info(n);
     if (!t) die("no tensor " + n);
     if (t->elements() != (uint64_t) N * Kd) die(n + ": " + std::to_string(t->elements()) + " values");
+    if (g_dense_q8 && g_req8 && t->type != k::kQ8_0 && Kd % 128 == 0) {
+        Mat m;
+        m.type = k::kQ8_0, m.N = N, m.K = Kd;
+        const auto q = q8_blocks_of(host_f32(S, n, (size_t) N * Kd));
+        if (upload_planar(m, {q.data()}, {(size_t) N * Kd})) return m;
+    }
+    if (t->type == 30 && !g_dense_q8) {   // BF16 (GSQ-RCO's attn_rel), F16 mode: its values as an FP16 matrix
+        Mat m;
+        m.type = 1, m.N = N, m.K = Kd;
+        m.f16 = dev_f16(host_f32(S, n, (size_t) N * Kd));
+        return m;
+    }
     if (!k::block_values((int) t->type) || Kd % k::block_values((int) t->type))
         die(n + ": type " + t->type_name() + " not read here");
     Mat m;
@@ -580,6 +619,15 @@ Mat load_fused_f16(const Shards& S, const std::vector<MatPart>& parts, int Kd) {
             const auto* t = S.info(pt.name);
             if (!t) die("no tensor " + pt.name);
             if (t->elements() != (uint64_t) pt.N * Kd) die(pt.name + ": " + std::to_string(t->elements()) + " values");
+            if (t->type == 30) {   // BF16: through F32 on the host
+                const auto v = host_f32(S, pt.name, (size_t) pt.N * Kd);
+                ensure_stage(v.size() * 4);
+                CU(cudaMemcpy(g_stage, v.data(), v.size() * 4, cudaMemcpyHostToDevice));
+                k::to_f16((const float*) g_stage, v.size(), m.f16 + (size_t) row * Kd, g_s);
+                CU(cudaStreamSynchronize(g_s));
+                row += pt.N;
+                continue;
+            }
             if (!k::block_values((int) t->type) || Kd % k::block_values((int) t->type))
                 die(pt.name + ": type " + t->type_name() + " not read here");
             const size_t nb = tensor_bytes(*t);
@@ -599,6 +647,25 @@ Mat load_fused_f16(const Shards& S, const std::vector<MatPart>& parts, int Kd) {
 }
 
 bool try_load_fused_raw(const Shards& S, const std::vector<MatPart>& parts, int Kd, Mat& out) {
+    if (g_req8 && Kd % 128 == 0) {
+        bool all = true;
+        for (const auto& pt : parts) all = all && pt.f32.empty() && S.info(pt.name);
+        if (all) {
+            std::vector<std::vector<uint8_t>> qs;
+            std::vector<const uint8_t*> ps;
+            std::vector<size_t> vs;
+            int N_tot = 0;
+            for (const auto& pt : parts) {
+                const size_t nv = (size_t) pt.N * Kd;
+                if ((int) S.info(pt.name)->type == k::kQ8_0) ps.push_back(S.data(pt.name));
+                else qs.push_back(q8_blocks_of(host_f32(S, pt.name, nv))), ps.push_back(qs.back().data());
+                vs.push_back(nv), N_tot += pt.N;
+            }
+            out = Mat{};
+            out.type = k::kQ8_0, out.N = N_tot, out.K = Kd;
+            if (upload_planar(out, ps, vs)) return true;
+        }
+    }
     int ty = -1, N_tot = 0;
     size_t nb_tot = 0;
     for (const auto& pt : parts) {
@@ -1471,9 +1538,8 @@ void loop_gates_chunk(Work& W, const k::LoopGate* gt, int n, int T, int C, int R
     static const int skip = 0;   // (a timing probe of the development build, off here)
     if (skip & 4) return;
     for (int j = 0; j < n; ++j) {
-        // g in one pass (IK2_GATE_FUSE); else the down products, then the mix
-        const bool fused = !(skip & 1) && k::loop_gate_downmix_rdna(gt[j].x, gt[j].m, gt[j].D, T, C, R, eps, g, g_s);
-        if (!fused) {
+        if (!(skip & 1) && k::loop_gate_downmix_rdna(gt[j].x, gt[j].m, gt[j].D, T, C, R, eps, g, g_s)) {
+        } else {
             // a1 [T][R] = x D_x^T, a2 = m D_m^T (D [R][2 C]: its rows' halves)
             if (!(skip & 1) && !k::loop_gate_down_rdna(gt[j].x, gt[j].m, gt[j].D, T, C, R, a1, a2, g_s)) {
                 if (!(skip & 1) && !k::gemm_f32_rdna(gt[j].x, C, T, gt[j].D, R, C, 2 * C, 1, a1, R, g_s))
@@ -4513,7 +4579,9 @@ int main(int argc, char** argv) {
     Shards S(model);
     Model M;
     Config& c = M.c;
-    const std::string a = "inkling2.";
+    // the keys' prefix: general.architecture (unsloth's files say "inkling2", ISTA-DASLab's GSQ-RCO "inkling2_loop")
+    const strata::MetaValue* arch = S.get("general.architecture");
+    const std::string a = (arch && arch->type == strata::MetaType::STRING && !arch->s.empty() ? arch->s : "inkling2") + ".";
     // a key under PR #32187's name, else under llama.cpp master's; a value master writes a visit (an array of equal
     // values) read as one
     auto key = [&](const char* k1, const char* k2 = nullptr) -> double {
@@ -4546,19 +4614,30 @@ int main(int argc, char** argv) {
     c.up_cap = (float) key("mlp_up_softcap", "activation.situ_linear_beta");
     c.logit_cap = (float) key("final_logit_softcapping");
     // the loop (Inkling-2-Mini): block_count counts the layer visits, the core's layers once a pass
-    if (S.get(a + "num_loops")) c.n_pass = (int) key("num_loops");
+    // llama.cpp's inkling2_loop (b12611+, the GSQ-RCO files): block_count counts the physical layers, the loop is
+    // loop.start / loop.end / loop.count, and the sliding pattern has one entry a physical layer
+    const bool loop_phys = S.get(a + "loop.count") != nullptr;
+    // (GSQ-RCO: its K-quant / BF16 dense weights as Q8_0 by default - gated; IK2_REQ8=0 keeps them as they are)
+    if (loop_phys && !getenv("IK2_REQ8")) g_req8 = true;
+    if (loop_phys) c.n_pass = (int) key("loop.count");
+    else if (S.get(a + "num_loops")) c.n_pass = (int) key("num_loops");
     if (c.n_pass > 1) {
-        c.core0 = (int) key("loop.core_start"), c.core1 = (int) key("loop.core_end"), c.rank = (int) key("loop.gate_rank");
+        if (loop_phys) c.core0 = (int) key("loop.start"), c.core1 = (int) key("loop.end");
+        else c.core0 = (int) key("loop.core_start"), c.core1 = (int) key("loop.core_end");
+        c.rank = (int) key("loop.gate_rank");
         if (c.core0 <= 0 || c.core1 <= c.core0 || c.core0 % c.block || (c.core1 - c.core0) % c.block || c.rank <= 0)
             die("the looped core must start after the first block and span whole blocks");
     }
     const int n_core = c.core1 - c.core0;
+    if (loop_phys) c.n_visit += (c.n_pass - 1) * n_core;   // (the visits a token: the core's layers once a pass)
     c.n_layer = c.n_visit - (c.n_pass - 1) * n_core;
-    {   // the pattern is a visit's; a layer's is its first visit's (the same in every pass)
+    {   // the pattern is a visit's (unsloth's) or a layer's (inkling2_loop); a layer's is its first visit's
         const auto* sp = S.get(a + "attention.sliding_window_pattern");
-        if (!sp || (int) sp->items.size() != c.n_visit) die("sliding_window_pattern");
+        if (!sp || ((int) sp->items.size() != c.n_visit && (int) sp->items.size() != c.n_layer))
+            die("sliding_window_pattern");
+        const bool per_layer = (int) sp->items.size() == c.n_layer && c.n_layer != c.n_visit;
         for (int l = 0; l < c.n_layer; ++l)
-            c.sliding.push_back(sp->items[l < c.core1 ? l : l + (c.n_pass - 1) * n_core].u != 0);
+            c.sliding.push_back(sp->items[per_layer || l < c.core1 ? l : l + (c.n_pass - 1) * n_core].u != 0);
     }
     // (a row of an expert is whole blocks of its type: checked per tensor below; 64 covers NVFP4 and Q8_0)
     if (c.D != 128 || c.H % c.KV || c.C % 64 || c.F % 64) die("unexpected shapes");
@@ -4762,7 +4841,10 @@ int main(int argc, char** argv) {
     M.embd_norm = load_f32(S, "token_embd_norm.weight", C);   // (on GPU 0, where the embedding rows go)
     std::vector<float> lp_q, lp_kv;   // a looped core's message queries, [2 n_core][C] each
     std::vector<float> lp_all;
-    if (c.n_pass > 1) {
+    // llama.cpp's inkling2_loop layout (b12611+, e.g. ISTA-DASLab's GSQ-RCO files): the gates as loop_{q,k,v,ffn}_ctrl_*
+    // and each core layer's 4 message queries as its own loop_msg_query [4][C] (q, k, v, the MoE's: the order below)
+    const bool ctrl_names = S.info("blk." + std::to_string(c.core0) + ".loop_q_ctrl_down.weight") != nullptr;
+    if (c.n_pass > 1 && !ctrl_names) {
         lp_q = host_f32(S, "loop_res_query.weight", (size_t) 2 * n_core * C);
         lp_kv = host_f32(S, "loop_kv_res_query.weight", (size_t) 2 * n_core * C);
     }
@@ -4889,8 +4971,9 @@ int main(int argc, char** argv) {
         }
         if (c.n_pass > 1 && l >= c.core0 && l < c.core1) {   // the core: its later passes' message gates and queries
             static const char* mod[4] = {"attn", "k", "v", "mlp"};
+            static const char* mod_ctrl[4] = {"q_ctrl", "k_ctrl", "v_ctrl", "ffn_ctrl"};   // (inkling2_loop's names)
             for (int m = 0; m < 4; ++m) {
-                const std::string p = b + "loop_" + mod[m] + "_";
+                const std::string p = b + "loop_" + (ctrl_names ? mod_ctrl[m] : mod[m]) + "_";
                 const bool compact = g_fast_want && getenv("IK2_GATE_BF16") && atoi(getenv("IK2_GATE_BF16"));
                 const auto down = host_f32(S, p + "down.weight", (size_t)c.rank * 2 * C);
                 Ly.lp_down[m] = dev_f32(down);
@@ -4907,10 +4990,14 @@ int main(int argc, char** argv) {
             // loop_res_query: rows 2 i (q's) and 2 i + 1 (the MoE's) of core layer i; loop_kv_res_query: k's and v's
             const size_t i = (size_t) (l - c.core0);
             std::vector<float> q(4 * C);
-            std::memcpy(q.data(), lp_q.data() + 2 * i * C, C * 4);
-            std::memcpy(q.data() + C, lp_kv.data() + 2 * i * C, C * 4);
-            std::memcpy(q.data() + 2 * C, lp_kv.data() + (2 * i + 1) * C, C * 4);
-            std::memcpy(q.data() + 3 * C, lp_q.data() + (2 * i + 1) * C, C * 4);
+            if (ctrl_names) {   // loop_msg_query [4][C]: q's, k's, v's, the MoE's - already in this order
+                q = host_f32(S, b + "loop_msg_query.weight", 4 * C);
+            } else {
+                std::memcpy(q.data(), lp_q.data() + 2 * i * C, C * 4);
+                std::memcpy(q.data() + C, lp_kv.data() + 2 * i * C, C * 4);
+                std::memcpy(q.data() + 2 * C, lp_kv.data() + (2 * i + 1) * C, C * 4);
+                std::memcpy(q.data() + 3 * C, lp_q.data() + (2 * i + 1) * C, C * 4);
+            }
             Ly.lp_query = dev_f32(q);
             lp_all.insert(lp_all.end(), q.begin(), q.end());
             if (l == c.core1 - 1) M.lp_query_all = dev_f32(lp_all);

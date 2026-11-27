@@ -1,7 +1,8 @@
 # MayaInk-AMD: Inkling 2 Mini on RDNA 3 / 3.5
 
 A HIP engine for Thinking Machines Lab's [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on AMD
-RDNA 3 and RDNA 3.5 GPUs under Windows, using Unsloth's `Inkling-2-Mini-UD-IQ4_XS.gguf`. It is a port of the `maya-ik2`
+RDNA 3 and RDNA 3.5 GPUs under Windows, using Unsloth's `Inkling-2-Mini-UD-IQ4_XS.gguf` or ISTA-DASLab's smaller
+`Inkling-2-Mini-GSQ-RCO-IQ3_S.gguf`. It is a port of the `maya-ik2`
 engine from [alesha-pro/maya-inkling-mini](https://github.com/alesha-pro/maya-inkling-mini) (commit `c520fd1`, written
 for CUDA on an RTX 3090), with new kernels for AMD's matrix cores, support for the extra weight formats of the IQ4_XS
 file, and a reworked single-token path.
@@ -32,6 +33,41 @@ For comparison, the same file with strata-inkling 0.1.67 on the RX 7900 XT: 2,03
 The engine's top-1 tokens match llama.cpp's greedy reference on 188 of 188 single-token steps and 192 of 192 prompt
 positions (short prompts), and on 93 of 94 and 95 of 96 positions of two long prompts. Every miss is a near tie.
 
+## Two GGUF files
+
+Since 1.4.0 the engine also runs ISTA-DASLab's
+[Inkling-2-Mini-GSQ-RCO-IQ3_S.gguf](https://huggingface.co/ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF) (11.4 GB, against
+15.7 GB for Unsloth's UD-IQ4_XS). The engine reads the file's layout from its metadata; nothing has to be converted.
+
+GSQ-RCO file with 1.4.0, same settings as above, medians of 3 alternating runs (tok/s):
+
+| | RX 7900 XT 20 GB | Radeon 8060S (iGPU) |
+|---|---|---|
+| Decode, 27-token prompt | 103 | 43 |
+| Decode after 511 tokens | 101 | |
+| Decode after 4,095 tokens | 96 | 41 |
+| Decode after 32,760 tokens | 85 | |
+| Prompt, 511 tokens | 1,840 | |
+| Prompt, 4,095 tokens | 3,210 | 1,520 |
+| Prompt, 32,760 tokens | 2,870 | |
+
+Its top-1 tokens match llama.cpp b12720's greedy reference on 186 of 188 single-token steps and 188 of 192 prompt
+positions (short prompts), and 93 of 94 and 95 of 96 on the long ones; every miss is a near tie.
+
+**Why the smaller file is not faster.** Decode here is not limited by how many bytes a token reads. Inkling 2 Mini
+runs its middle layers three times, so a token is 48 layer passes one after another, each a chain of small kernels.
+At 100 tok/s the RX 7900 XT reads about 1.1 GB a token, an eighth of its memory bandwidth: the time goes to the fixed
+cost of each step, and a smaller file shortens only the part that was never the bottleneck. The GSQ file's formats
+also cost more to unpack than the UD file's: its experts are 3-bit i-quants (IQ3_XXS, values looked up in a grid
+with separate sign bits) where the UD file has NVFP4 (two instructions a pair of values), and its attention weights are
+a mix of Q4_K, Q5_K, Q6_K and BF16 where the UD file has Q8_0 throughout.
+
+What 1.4.0 does about it: those attention weights are converted to Q8_0 while the file loads, so they take the same
+single kernel as the UD file's (decode 65 -> 82 tok/s on the RX 7900 XT); the expert kernels have compiled versions
+for IQ3_XXS and IQ4_NL (82 -> 100 tok/s, identical output). The conversion changes values by less than 0.5% and the
+output slightly; `IK2_REQ8=0` keeps the file's weights as they are (about 76 tok/s), with output that matches the
+earlier engine exactly. Load takes about 10 s longer with the conversion.
+
 - [OPTIMIZATION.md](OPTIMIZATION.md): what made it faster and what did not.
 - [BENCHMARKS.md](BENCHMARKS.md): method, raw numbers, the quality check and its limits.
 
@@ -44,7 +80,10 @@ positions (short prompts), and on 93 of 94 and 95 of 96 positions of two long pr
   its headers.
 - Python 3.10 or newer, and AMD's ROCm SDK 7.14.1 Python packages.
 - `Inkling-2-Mini-UD-IQ4_XS.gguf` from [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)
-  (revision `ae9327c5fbc7333116ba32eee78bb5d2bbefae4f`).
+  (revision `ae9327c5fbc7333116ba32eee78bb5d2bbefae4f`), or `Inkling-2-Mini-GSQ-RCO-IQ3_S.gguf` from
+  [ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF) (revision
+  `f0da1097633dd7c2f5733e4077cff861be122245`). The GSQ file needs 8.9 GiB for its experts and 1.2 GiB for its dense
+  weights.
 
 ## Build
 
@@ -97,6 +136,8 @@ used for text chat, one conversation at a time.
 | `IK2_KV=fp8` (`-Fp8Kv`) | FP16 | Half the KV memory, and faster decode at long contexts. On the long reference it scored 94 of 96 on the prompt path, against 95 of 96 for FP16. |
 | `IK2_GATE_BF16=1`, `IK2_GATE_TILE=64` | set by the scripts | Loop-gate weights read as BF16 (they hold exact BF16 values), 64 channels a block. |
 | `IK2_GATE_FUSE=16` (`-NoGateFuse` turns it off) | set by the scripts | The loop gates' down products and mix in one pass, 16 tokens a block (`=1`: 32). Prompts 2-7% faster; another summing order, so some tokens differ from 1.2.0, with the same reference agreement. |
+| `IK2_REQ8=0` / `1` | 1 for GSQ-RCO files, 0 otherwise | Dense weights of other block types (the GSQ file's K-quants and BF16) converted to Q8_0 at load: faster decode, slightly different output, about 10 s more load time. |
+| `IK2_TOKTY=0` | 1 | The single-token expert kernels for IQ3_XXS and IQ4_NL take the general path instead of their compiled versions. Same output, slower. |
 | `IK2_GATE_DOWN=1` | 0 | Only the loop gates' two down products in one kernel. Superseded by `IK2_GATE_FUSE`. |
 | `IK2_FLASH_INL1=0` / `1` | 1 on the 8060S, 0 on the RX 7900 XT | Prompt attention computes its relative-position bias itself instead of reading a precomputed table. Same tokens either way; faster on the 8060S, slower on the RX 7900 XT. |
 | `IK2_FLASH2=4` | 0 | Prompt attention with one lane per query: faster prompts on the 8060S, no gain on the RX 7900 XT. Its tokens differ from the default; its agreement with the reference is the same (BENCHMARKS.md). |
@@ -118,6 +159,7 @@ fails, so a failure is visible rather than a hang.
 ```
 
 `gate.py` teacher-forces llama.cpp's greedy tokens through both paths of the engine and reports top-1 agreement.
+For the GSQ-RCO file use `--ref scripts\reference-gsq.json` (the same prompts, from llama.cpp b12720).
 `bench.py` alternates builds and reports prompt and decode speed and whether their generated tokens are identical.
 
 ## Repository layout
@@ -140,4 +182,5 @@ two GPUs above before it was kept.
 
 Code: MIT (see [LICENSE](LICENSE)), as the upstream engine. Parts of `src/ik2/ik2_rdna.inc` follow designs from CIRU AI's
 Apache-2.0 project; those kernels are marked in the source. [NOTICE](NOTICE) lists every source with its version and the
-files involved. The model is by Thinking Machines Lab (Apache-2.0) and the GGUF by Unsloth; neither is included.
+files involved. `third_party/ggml/ggml-common.h` (the i-quant grids) is ggml's, MIT. The model is by Thinking Machines
+Lab (Apache-2.0) and the GGUF files by Unsloth and ISTA-DASLab; none is included.

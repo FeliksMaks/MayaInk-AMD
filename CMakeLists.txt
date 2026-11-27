@@ -14,7 +14,7 @@ set_source_files_properties(${IK2_FILES} PROPERTIES LANGUAGE HIP)
 add_executable(maya-ik2 ${IK2_FILES} ${IK2}/ik2_cpu.cpp)
 set_source_files_properties(${IK2}/ik2_cpu.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-ffp-contract=off")
 target_include_directories(maya-ik2 BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/amd/compat ${COMPAT}
-                           ${CMAKE_CURRENT_SOURCE_DIR}/include ${IK2})
+                           ${CMAKE_CURRENT_SOURCE_DIR}/include ${IK2} ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
 target_compile_definitions(maya-ik2 PRIVATE STRATA_USE_HIP=1 IK2_HIP=1 STRATA_HAS_WMMA=1 NOMINMAX _CRT_SECURE_NO_WARNINGS)
 target_compile_options(maya-ik2 PRIVATE "SHELL:-include \"${COMPAT}/cuda_runtime.h\""
                        "SHELL:-include \"${CMAKE_CURRENT_SOURCE_DIR}/amd/compat/ik2_hip_rt.h\"")

@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.4.0 - 2026-11-27
+
+- ISTA-DASLab's `Inkling-2-Mini-GSQ-RCO-IQ3_S.gguf` runs as well as Unsloth's UD-IQ4_XS file: its `inkling2_loop`
+  metadata (the loop's layers and count, the sliding pattern per physical layer), its loop-gate and message-query tensor
+  names, BF16 matrices, and the i-quant expert formats IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S with IQ4_NL or Q2_0
+  down, on the single-token path and in the prompt's matrix-core expert tiles. The grids come from ggml's
+  `ggml-common.h` (`third_party/ggml`, MIT).
+- GSQ-RCO decode: the dense attention weights (Q4_K, Q5_K, Q6_K, BF16) are converted to Q8_0 at load (`IK2_REQ8`, on
+  by default for this file), and the expert kernels have compiled versions for IQ3_XXS and IQ4_NL (`IK2_TOKTY`). RX 7900
+  XT 65 -> 103 tok/s with a short prompt, Radeon 8060S 34 -> 43. The conversion changes the output slightly, with the
+  same agreement with the llama.cpp reference within near ties; `IK2_REQ8=0` keeps the file's weights (77 tok/s on the
+  RX 7900 XT). `scripts/reference-gsq.json` is the reference for that file.
+- The UD-IQ4_XS file gives the same tokens and speed as 1.3.0.
+
 ## 1.3.0 - 2026-11-26
 
 - The looped layers' message gates compute their two down products and their mix in one kernel, reading the layer's

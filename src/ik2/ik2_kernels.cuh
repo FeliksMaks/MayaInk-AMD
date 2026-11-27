@@ -457,6 +457,8 @@ void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* bas
 /// ggml type ids of the blocks these decode.
 constexpr int kQ8_0 = 8, kQ5_K = 13, kQ6_K = 14, kIQ3_XXS = 18, kIQ4_XS = 23, kNVFP4 = 40;
 constexpr int kQ5_0 = 6, kQ4_K = 12, kIQ4_NL = 20;   // (AMD port: UD-IQ4_XS's layers 20-23)
+// (AMD port: ISTA-DASLab's GSQ-RCO files) the experts' other i-quants, llama.cpp's Q2_0 and BF16 (the embedding)
+constexpr int kIQ2_XXS = 16, kIQ2_XS = 17, kIQ1_S = 19, kIQ3_S = 21, kIQ2_S = 22, kBF16 = 30, kQ2_0 = 42;
 /// values a block / bytes a block (0: not one of the above).
 int block_values(int type);
 size_t block_bytes(int type);

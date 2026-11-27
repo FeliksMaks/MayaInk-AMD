@@ -1,6 +1,7 @@
 // src/ik2/ik2_kernels.cu - maya-ik2's kernels (the interface and the conventions: ik2_kernels.cuh).
 #include "ik2_kernels.cuh"
 #include "ik2_iq_tables.h"
+#include "ik2_iq_grids.h"   // (AMD port: the GSQ-RCO files' i-quant grids, ggml's)
 #include "ik2_hip.cuh"
 #ifdef IK2_HIP
 #include "strata/kernels/rdna_wmma.hpp"   // (AMD: the matrix cores - ik2_rdna.inc, from Maya 1.1.74)
@@ -2096,6 +2097,103 @@ __host__ __device__ __forceinline__ uint32_t iq_signs8(uint32_t s7) {
 #endif
 }
 
+// (AMD port: the GSQ-RCO files) IQ2_XXS / IQ2_XS / IQ2_S / IQ3_S / IQ1_S grids, ggml's (ik2_iq_grids.h)
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+#define IK2_GRID(name, i) __ldg(ik2_grid::dev::name + (i))
+#else
+#define IK2_GRID(name, i) (ik2_grid::host::name[(i)])
+#endif
+__host__ __device__ __forceinline__ uint64_t iq2xxs_grid_at(int i) { return IK2_GRID(iq2xxs_grid, i); }
+__host__ __device__ __forceinline__ uint64_t iq2xs_grid_at(int i) { return IK2_GRID(iq2xs_grid, i); }
+__host__ __device__ __forceinline__ uint64_t iq2s_grid_at(int i) { return IK2_GRID(iq2s_grid, i); }
+__host__ __device__ __forceinline__ uint32_t iq3s_grid_at(int i) { return IK2_GRID(iq3s_grid, i); }
+// value j of IQ1_S grid entry i (the device reads iq1s_grid_gpu: the nibbles g + 1; the host iq1s_grid: 8 int8)
+__host__ __device__ __forceinline__ int iq1_g(int i, int j) {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    return (int) ((__ldg(ik2_grid::dev::iq1s_grid_gpu + i) >> (8 * (j & 3) + 4 * (j >> 2))) & 0xFu) - 1;
+#else
+    return (int) (int8_t) (ik2_grid::host::iq1s_grid[i] >> (8 * j));
+#endif
+}
+__host__ __device__ __forceinline__ float bf16_bits_to_float(uint16_t b) {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    return __uint_as_float((uint32_t) b << 16);   // (a register bit-cast: no local copy)
+#else
+    const uint32_t u = (uint32_t) b << 16;
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
+#endif
+}
+
+// (AMD port) the GSQ-RCO files' types, one value: out of line, so the kernels that inline decode_value for the
+// other types keep their registers and no scratch
+__host__ __device__ __noinline__ float decode_value_gsq(int type, const uint8_t* blocks, size_t v) {
+    // (AMD port: the GSQ-RCO files' types, ggml's block layouts; the i-quants as Project Maya 1.1.83's ik2 reads them)
+    if (type == kIQ2_XXS) {   // d, qs [64]: 8 x (4 grid bytes, then 3 sign bytes and a 4-bit scale in the top nibble)
+        const uint8_t* b = blocks + (v / 256) * 66;
+        const int i = (int) (v % 256), ib = i / 32, l = (i % 32) / 8, j = i % 8;
+        const uint8_t* q = b + 2 + 8 * ib;
+        const uint32_t aux = (uint32_t) q[4] | ((uint32_t) q[5] << 8) | ((uint32_t) q[6] << 16) | ((uint32_t) q[7] << 24);
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const float db = d * (0.5f + (float) (aux >> 28)) * 0.25f;
+        const uint32_t sg = iq_signs8((aux >> (7 * l)) & 127u);
+        const uint64_t g = iq2xxs_grid_at(q[l]);
+        return db * (float) ((g >> (8 * j)) & 0xFFu) * ((sg >> j) & 1u ? -1.0f : 1.0f);
+    }
+    if (type == kIQ2_XS) {   // d, qs [64] (4 x 16-bit: a 9-bit grid index and 7 sign bits), scales [8]
+        const uint8_t* b = blocks + (v / 256) * 74;
+        const int i = (int) (v % 256), ib = i / 32, l = (i % 32) / 8, j = i % 8;
+        const uint8_t* q = b + 2 + 8 * ib + 2 * l;
+        const uint32_t q16 = (uint32_t) q[0] | ((uint32_t) q[1] << 8);
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const float db = d * (0.5f + (float) ((b[66 + ib] >> (l < 2 ? 0 : 4)) & 0xF)) * 0.25f;
+        const uint32_t sg = iq_signs8(q16 >> 9);
+        const uint64_t g = iq2xs_grid_at((int) (q16 & 511u));
+        return db * (float) ((g >> (8 * j)) & 0xFFu) * ((sg >> j) & 1u ? -1.0f : 1.0f);
+    }
+    if (type == kIQ2_S) {   // d, grid bytes [32], sign bytes [32], qh [8] (their 2 top bits), scales [8]
+        const uint8_t* b = blocks + (v / 256) * 82;
+        const int i = (int) (v % 256), ib = i / 32, l = (i % 32) / 8, j = i % 8;
+        const int idx = (int) b[2 + 4 * ib + l] | (int) (((uint32_t) b[66 + ib] << (8 - 2 * l)) & 0x300u);
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const float db = d * (0.5f + (float) ((b[74 + ib] >> (l < 2 ? 0 : 4)) & 0xF)) * 0.25f;
+        const uint32_t sg = b[34 + 4 * ib + l];
+        const uint64_t g = iq2s_grid_at(idx);
+        return db * (float) ((g >> (8 * j)) & 0xFFu) * ((sg >> j) & 1u ? -1.0f : 1.0f);
+    }
+    if (type == kIQ3_S) {   // d, qs [64], qh [8] (the 9th index bit), signs [32], scales [4]
+        const uint8_t* b = blocks + (v / 256) * 110;
+        const int i = (int) (v % 256), ib = i / 32, il = (i % 32) / 8, jj = i % 8;
+        const uint32_t hh = b[66 + ib];
+        const int i1 = (int) b[2 + 8 * ib + 2 * il] | (int) ((hh << (8 - 2 * il)) & 256u);
+        const int i2 = (int) b[2 + 8 * ib + 2 * il + 1] | (int) ((hh << (7 - 2 * il)) & 256u);
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const float dl = d * (float) (1 + 2 * ((b[106 + (ib >> 1)] >> (4 * (ib & 1))) & 0xF));
+        const uint32_t g = iq3s_grid_at(jj < 4 ? i1 : i2);
+        const uint32_t sg = b[74 + 4 * ib + il];
+        return dl * (float) ((g >> (8 * (jj & 3))) & 0xFFu) * ((sg >> jj) & 1u ? -1.0f : 1.0f);
+    }
+    if (type == kIQ1_S) {   // d, qs [32], qh [8] (16 bits a sub-block: 4 x 3 top index bits, a 3-bit scale, the sign)
+        const uint8_t* b = blocks + (v / 256) * 50;
+        const int i = (int) (v % 256), ib = i / 32, l = (i % 32) / 8, j = i % 8;
+        const uint32_t hh = (uint32_t) b[34 + 2 * ib] | ((uint32_t) b[35 + 2 * ib] << 8);
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const float dl = d * (float) (2 * (int) ((hh >> 12) & 7u) + 1);
+        const float delta = (hh & 0x8000u) ? -0.125f : 0.125f;   // (ggml's IQ1S_DELTA)
+        const int g = iq1_g((int) b[2 + 4 * ib + l] | (int) (((hh >> (3 * l)) & 7u) << 8), j);
+        return dl * ((float) g + delta);
+    }
+    if (type == kQ2_0) {   // llama.cpp's Q2_0 (ggml type 42): d, qs [16] - 64 values of 2 bits, (q - 1) d
+        const uint8_t* b = blocks + (v / 64) * 18;
+        const int j = (int) (v % 64);
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        return (float) ((int) ((b[2 + j / 4] >> (2 * (j % 4))) & 3u) - 1) * d;
+    }
+    if (type == kBF16) return bf16_bits_to_float((uint16_t) (blocks[2 * v] | (blocks[2 * v + 1] << 8)));
+    return 0.0f;
+}
+
 __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, size_t v) {
     if (type == kNVFP4) {
         const int8_t kv[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
@@ -2192,6 +2290,9 @@ __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, s
         const uint8_t q = b[2 + (j & 15)];
         return d * (float) iq4nl_at(j < 16 ? (q & 0xF) : (q >> 4));
     }
+    if (type == kIQ2_XXS || type == kIQ2_XS || type == kIQ2_S || type == kIQ3_S || type == kIQ1_S || type == kQ2_0 ||
+        type == kBF16)
+        return decode_value_gsq(type, blocks, v);   // (out of line: the existing kernels keep their registers)
     return 0.0f;
 }
 
@@ -2552,6 +2653,235 @@ __device__ float row_dot(int type, const uint8_t* w, const float* xs, int K) {
         acc = row_dot_ext(type, w, xs, K, lane);
     } else {
         for (int i = lane; i < K; i += 32) acc += decode_value(type, w, (size_t) i) * xs[xp(i)];
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    return acc;
+}
+
+// ---- (AMD port) the GSQ-RCO files' expert types: a 32-value sub-block against 32 inputs (xv: 8 float4)
+__host__ __device__ constexpr bool gsq_type(int t) {
+    return t == kIQ2_XXS || t == kIQ2_XS || t == kIQ2_S || t == kIQ3_S || t == kIQ1_S || t == kQ2_0;
+}
+// (AMD port) the token kernels' compile-time types: the GSQ types and GSQ-RCO's main expert types IQ3_XXS / IQ4_NL
+// (IK2_TOKTY=0: IQ3_XXS / IQ4_NL back on the run-time type path)
+__host__ __device__ constexpr bool tok_fast_type(int t) { return gsq_type(t) || t == kIQ3_XXS || t == kIQ4_NL; }
+// four / two bytes as a uint32 from any address (the block sizes 18 / 50 / 66 / 74 / 82 / 110 put rows anywhere)
+__device__ __forceinline__ uint32_t gsq_ld4u(const uint8_t* p) {
+    uint32_t v;
+    __builtin_memcpy(&v, p, 4);
+    return v;
+}
+__device__ __forceinline__ uint32_t gsq_ld2u(const uint8_t* p) {
+    uint16_t v;
+    __builtin_memcpy(&v, p, 2);
+    return v;
+}
+// IQ1_S: 4 grid values (the nibbles g + 1 in the bytes of n, the delta d8 = +-1/8 added) against 4 inputs
+__device__ __forceinline__ float gsq_iq1_dot4(uint32_t n, float d8, float4 x) {
+    return ((float) ((int) (n & 15u) - 1) + d8) * x.x + ((float) ((int) ((n >> 8) & 15u) - 1) + d8) * x.y +
+           ((float) ((int) ((n >> 16) & 15u) - 1) + d8) * x.z + ((float) ((int) ((n >> 24) & 15u) - 1) + d8) * x.w;
+}
+template <int TY>
+__device__ __forceinline__ float gsq_sub32_dot(const uint8_t* w, int sb, const float4 (&xv)[8]) {
+    if constexpr (TY == kIQ3_XXS) {
+        return iq3xxs_sub_dot(w + (size_t) (sb >> 3) * 98, sb & 7, xv);
+    } else if constexpr (TY == kIQ4_NL) {   // d, qs [16]: byte j's low nibble value j, its high nibble j + 16
+        const uint8_t* b = w + (size_t) sb * 18;
+        const float d = half_bits_to_float((uint16_t) gsq_ld2u(b));
+        float a = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t q = gsq_ld4u(b + 2 + 4 * k);
+            a += dot_u32_f4(iq4nl_lut4(q, false), xv[k]) + dot_u32_f4(iq4nl_lut4(q, true), xv[4 + k]);
+        }
+        return d * a;
+    } else if constexpr (TY == kIQ1_S) {   // d, qs [32], qh [8]: a value dl (g + delta), g in {-1, 0, 1}, delta +-1/8
+        const uint8_t* b = w + (size_t) (sb >> 3) * 50;
+        const int ib = sb & 7;
+        const uint32_t q = gsq_ld4u(b + 2 + 4 * ib), h = gsq_ld2u(b + 34 + 2 * ib);
+        const float dl = half_bits_to_float((uint16_t) gsq_ld2u(b)) * (float) (2 * (int) ((h >> 12) & 7u) + 1);
+        const float d8 = (h & 0x8000u) ? -0.125f : 0.125f;
+        float a = 0.0f;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t n = __ldg(ik2_grid::dev::iq1s_grid_gpu + (((q >> (8 * l)) & 0xFFu) | (((h >> (3 * l)) & 7u) << 8)));
+            a += gsq_iq1_dot4(n, d8, xv[2 * l]) + gsq_iq1_dot4(n >> 4, d8, xv[2 * l + 1]);
+        }
+        return dl * a;
+    } else if constexpr (TY == kIQ2_XXS) {
+        const uint8_t* b = w + (size_t) (sb >> 3) * 66;
+        const uint8_t* q = b + 2 + 8 * (sb & 7);
+        const uint32_t qw = gsq_ld4u(q), aux = gsq_ld4u(q + 4);
+        const float d = half_bits_to_float((uint16_t) gsq_ld2u(b));
+        float a = 0.0f;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint64_t g = iq2xxs_grid_at((int) ((qw >> (8 * l)) & 0xFFu));
+            const uint32_t sg = iq_signs8((aux >> (7 * l)) & 127u);
+            a += sdot4_u8((uint32_t) g, sg, xv[2 * l]) + sdot4_u8((uint32_t) (g >> 32), sg >> 4, xv[2 * l + 1]);
+        }
+        return d * (0.5f + (float) (aux >> 28)) * 0.25f * a;
+    } else if constexpr (TY == kIQ2_XS || TY == kIQ2_S) {   // (a 4-bit scale a half: l < 2 the low nibble)
+        constexpr bool xs = TY == kIQ2_XS;
+        const uint8_t* b = w + (size_t) (sb >> 3) * (xs ? 74 : 82);
+        const int ib = sb & 7;
+        const uint8_t* q = b + 2 + (xs ? 8 * ib : 4 * ib);
+        const uint32_t sc = b[xs ? 66 + ib : 74 + ib];
+        const float d = half_bits_to_float((uint16_t) gsq_ld2u(b));
+        float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            uint64_t g;
+            uint32_t sg;
+            if constexpr (xs) {   // a 16-bit entry: a 9-bit grid index and 7 sign bits
+                const uint32_t q16 = (uint32_t) q[2 * l] | ((uint32_t) q[2 * l + 1] << 8);
+                g = iq2xs_grid_at((int) (q16 & 511u));
+                sg = iq_signs8(q16 >> 9);
+            } else {   // a grid byte and its 2 top bits in qh, the signs a byte
+                g = iq2s_grid_at((int) q[l] | (int) (((uint32_t) b[66 + ib] << (8 - 2 * l)) & 0x300u));
+                sg = b[34 + 4 * ib + l];
+            }
+            const float v = sdot4_u8((uint32_t) g, sg, xv[2 * l]) + sdot4_u8((uint32_t) (g >> 32), sg >> 4, xv[2 * l + 1]);
+            (l < 2 ? a0 : a1) += v;
+        }
+        return d * 0.25f * ((0.5f + (float) (sc & 15)) * a0 + (0.5f + (float) (sc >> 4)) * a1);
+    } else if constexpr (TY == kIQ3_S) {   // 4 grid bytes + the 9th index bits in qh, 4 sign bytes, scale 1 + 2 s
+        const uint8_t* b = w + (size_t) (sb >> 3) * 110;
+        const int ib = sb & 7;
+        const uint8_t* q = b + 2 + 8 * ib;
+        const uint32_t h = b[66 + ib];
+        const float dl = half_bits_to_float((uint16_t) gsq_ld2u(b)) *
+                         (float) (1 + 2 * ((b[106 + (ib >> 1)] >> (4 * (ib & 1))) & 0xF));
+        float a = 0.0f;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t g1 = iq3s_grid_at((int) q[2 * l] | (int) ((h << (8 - 2 * l)) & 256u));
+            const uint32_t g2 = iq3s_grid_at((int) q[2 * l + 1] | (int) ((h << (7 - 2 * l)) & 256u));
+            const uint32_t sg = b[74 + 4 * ib + l];
+            a += sdot4_u8(g1, sg, xv[2 * l]) + sdot4_u8(g2, sg >> 4, xv[2 * l + 1]);
+        }
+        return dl * a;
+    } else {   // Q2_0: d, qs [16] (64 values of 2 bits, (q - 1) d); sub-block sb: half (sb & 1) of block sb >> 1
+        const uint8_t* b = w + (size_t) (sb >> 1) * 18;
+        const uint8_t* q = b + 2 + 8 * (sb & 1);
+        const uint32_t q0 = gsq_ld4u(q), q1 = gsq_ld4u(q + 4);
+        float a = 0.0f;
+#pragma unroll
+        for (int k4 = 0; k4 < 8; ++k4) {
+            const uint32_t by = ((k4 < 4 ? q0 : q1) >> (8 * (k4 & 3))) & 0xFFu;
+            const float4 x = xv[k4];
+            a += (float) ((int) (by & 3u) - 1) * x.x + (float) ((int) ((by >> 2) & 3u) - 1) * x.y +
+                 (float) ((int) ((by >> 4) & 3u) - 1) * x.z + (float) ((int) (by >> 6) - 1) * x.w;
+        }
+        return half_bits_to_float((uint16_t) gsq_ld2u(b)) * a;
+    }
+}
+// (AMD port) the 32 values of sub-block b32 of a row of GSQ type TY (the prompt tiles' FP16 decode)
+template <int TY>
+__device__ __forceinline__ void gsq_vals32(const uint8_t* row, int b32, float (&y)[32]) {
+    if constexpr (TY == kQ2_0) {   // 64-value blocks of 18 bytes: d, 16 bytes of 2-bit codes, (q - 1) d
+        const uint8_t* b = row + (size_t) (b32 >> 1) * 18;
+        const float d = half_bits_to_float((uint16_t) gsq_ld2u(b));
+        const uint8_t* q = b + 2 + 8 * (b32 & 1);
+#pragma unroll
+        for (int j = 0; j < 32; ++j) y[j] = (float) ((int) ((q[j >> 2] >> (2 * (j & 3))) & 3u) - 1) * d;
+    } else if constexpr (TY == kIQ3_XXS) {   // d, qs [64] grid indices, [8] u32: a 4-bit scale + 4 x 7 sign bits
+        const uint8_t* b = row + (size_t) (b32 >> 3) * 98;
+        const int ib = b32 & 7;
+        const uint32_t aux = gsq_ld4u(b + 2 + 64 + 4 * ib);
+        const float db = half_bits_to_float((uint16_t) gsq_ld2u(b)) * (0.5f + (float) (aux >> 28)) * 0.5f;
+        const uint8_t* q = b + 2 + 8 * ib;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t sg = iq_signs8((aux >> (7 * l)) & 127u);
+            const uint32_t g1 = iq3xxs_grid_at(q[2 * l]), g2 = iq3xxs_grid_at(q[2 * l + 1]);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                y[8 * l + j] = db * (float) ((g1 >> (8 * j)) & 0xFFu) * ((sg >> j) & 1u ? -1.0f : 1.0f);
+                y[8 * l + 4 + j] = db * (float) ((g2 >> (8 * j)) & 0xFFu) * ((sg >> (4 + j)) & 1u ? -1.0f : 1.0f);
+            }
+        }
+    } else if constexpr (TY == kIQ1_S) {
+        const uint8_t* b = row + (size_t) (b32 >> 3) * 50;
+        const int ib = b32 & 7;
+        const uint32_t q = gsq_ld4u(b + 2 + 4 * ib), h = gsq_ld2u(b + 34 + 2 * ib);
+        const float dl = half_bits_to_float((uint16_t) gsq_ld2u(b)) * (float) (2 * (int) ((h >> 12) & 7u) + 1);
+        const float d8 = (h & 0x8000u) ? -0.125f : 0.125f;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t n = __ldg(ik2_grid::dev::iq1s_grid_gpu + (((q >> (8 * l)) & 0xFFu) | (((h >> (3 * l)) & 7u) << 8)));
+#pragma unroll
+            for (int j = 0; j < 8; ++j) y[8 * l + j] = dl * ((float) ((int) ((n >> (8 * (j & 3) + 4 * (j >> 2))) & 15u) - 1) + d8);
+        }
+    } else if constexpr (TY == kIQ2_XXS) {
+        const uint8_t* b = row + (size_t) (b32 >> 3) * 66;
+        const uint8_t* q = b + 2 + 8 * (b32 & 7);
+        const uint32_t aux = gsq_ld4u(q + 4);
+        const float db = half_bits_to_float((uint16_t) gsq_ld2u(b)) * (0.5f + (float) (aux >> 28)) * 0.25f;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t sg = iq_signs8((aux >> (7 * l)) & 127u);
+            const uint64_t g = iq2xxs_grid_at(q[l]);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) y[8 * l + j] = db * (float) ((g >> (8 * j)) & 0xFFu) * ((sg >> j) & 1u ? -1.0f : 1.0f);
+        }
+    } else if constexpr (TY == kIQ2_XS || TY == kIQ2_S) {
+        constexpr bool xs = TY == kIQ2_XS;
+        const uint8_t* b = row + (size_t) (b32 >> 3) * (xs ? 74 : 82);
+        const int ib = b32 & 7;
+        const uint8_t* q = b + 2 + (xs ? 8 * ib : 4 * ib);
+        const uint32_t sc = b[xs ? 66 + ib : 74 + ib];
+        const float d = half_bits_to_float((uint16_t) gsq_ld2u(b));
+        const float db0 = d * (0.5f + (float) (sc & 15)) * 0.25f, db1 = d * (0.5f + (float) (sc >> 4)) * 0.25f;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            uint64_t g;
+            uint32_t sg;
+            if constexpr (xs) {
+                const uint32_t q16 = (uint32_t) q[2 * l] | ((uint32_t) q[2 * l + 1] << 8);
+                g = iq2xs_grid_at((int) (q16 & 511u));
+                sg = iq_signs8(q16 >> 9);
+            } else {
+                g = iq2s_grid_at((int) q[l] | (int) (((uint32_t) b[66 + ib] << (8 - 2 * l)) & 0x300u));
+                sg = b[34 + 4 * ib + l];
+            }
+            const float db = l < 2 ? db0 : db1;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) y[8 * l + j] = db * (float) ((g >> (8 * j)) & 0xFFu) * ((sg >> j) & 1u ? -1.0f : 1.0f);
+        }
+    } else {   // IQ3_S
+        const uint8_t* b = row + (size_t) (b32 >> 3) * 110;
+        const int ib = b32 & 7;
+        const uint8_t* q = b + 2 + 8 * ib;
+        const uint32_t h = b[66 + ib];
+        const float dl = half_bits_to_float((uint16_t) gsq_ld2u(b)) *
+                         (float) (1 + 2 * ((b[106 + (ib >> 1)] >> (4 * (ib & 1))) & 0xF));
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t g1 = iq3s_grid_at((int) q[2 * l] | (int) ((h << (8 - 2 * l)) & 256u));
+            const uint32_t g2 = iq3s_grid_at((int) q[2 * l + 1] | (int) ((h << (7 - 2 * l)) & 256u));
+            const uint32_t sg = b[74 + 4 * ib + l];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                y[8 * l + j] = dl * (float) ((g1 >> (8 * j)) & 0xFFu) * ((sg >> j) & 1u ? -1.0f : 1.0f);
+                y[8 * l + 4 + j] = dl * (float) ((g2 >> (8 * j)) & 0xFFu) * ((sg >> (4 + j)) & 1u ? -1.0f : 1.0f);
+            }
+        }
+    }
+}
+// the tiles' GSQ types: gate/up's and down's
+__host__ __device__ constexpr bool gsq_tile_type(int t) { return gsq_type(t) || t == kIQ3_XXS; }
+
+// a warp's dot of one row of K values of type TY (a gsq_type) with xs (shared, padded: xp); every lane gets it
+template <int TY>
+__device__ float row_dot_gsq(const uint8_t* w, const float* xs, int K) {
+    const int lane = threadIdx.x & 31;
+    float acc = 0.0f;
+    for (int sb = lane; sb < K / 32; sb += 32) {
+        float4 xv[8];
+        load_xv8(xs + sb * 36, xv);
+        acc += gsq_sub32_dot<TY>(w, sb, xv);
     }
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
@@ -3194,7 +3524,10 @@ __global__ void experts_gate_up_swiglu_kernel(const uint8_t* const* blob, const 
         const int r = (blockIdx.x * WARPS + warp) * ROWS + j;
         if (r >= F) break;
         float vg, vu;
-        if (ty_gate == ty_up) {
+        if constexpr (tok_fast_type(TY)) {
+            vg = row_dot_gsq<TY>(bl + (size_t) r * rb_gate, xs, C);
+            vu = row_dot_gsq<TY>(bl + eb0 + (size_t) r * rb_up, xs, C);
+        } else if (ty_gate == ty_up) {
             row_dot_pair(ty_gate, bl + (size_t) r * rb_gate, bl + eb0 + (size_t) r * rb_up, xs, C, vg, vu);
         } else {
             vg = row_dot(ty_gate, bl + (size_t) r * rb_gate, xs, C);
@@ -3223,14 +3556,21 @@ __global__ void experts_down_kernel(const uint8_t* const* blob, int ty_down_rt, 
         if (row >= C) break;
         if (j + 1 < ROWS && row + 1 < C) {
             float v0, v1;
-            row_dot_2(ty_down, w + (size_t) row * rb_down, w + (size_t) (row + 1) * rb_down, xs, F, v0, v1);
+            if constexpr (tok_fast_type(TY)) {
+                v0 = row_dot_gsq<TY>(w + (size_t) row * rb_down, xs, F);
+                v1 = row_dot_gsq<TY>(w + (size_t) (row + 1) * rb_down, xs, F);
+            } else {
+                row_dot_2(ty_down, w + (size_t) row * rb_down, w + (size_t) (row + 1) * rb_down, xs, F, v0, v1);
+            }
             if ((threadIdx.x & 31) == 0) {
                 y[(size_t) s * C + row] = v0;
                 y[(size_t) s * C + row + 1] = v1;
             }
             j += 2;
         } else {
-            const float v = row_dot(ty_down, w + (size_t) row * rb_down, xs, F);
+            float v;
+            if constexpr (tok_fast_type(TY)) v = row_dot_gsq<TY>(w + (size_t) row * rb_down, xs, F);
+            else v = row_dot(ty_down, w + (size_t) row * rb_down, xs, F);
             if ((threadIdx.x & 31) == 0) y[(size_t) s * C + row] = v;
             j += 1;
         }
@@ -4185,7 +4525,9 @@ __global__ void mv_blocks_kernel(int type_rt, const uint8_t* W, int N, int K, si
     for (int j = 0; j < ROWS; ++j) {
         const int row = (blockIdx.x * WARPS + warp) * ROWS + j;
         if (row >= N) break;
-        const float v = row_dot(type, W + (size_t) row * rb, xs, K);
+        float v;
+        if constexpr (tok_fast_type(TY)) v = row_dot_gsq<TY>(W + (size_t) row * rb, xs, K);
+        else v = row_dot(type, W + (size_t) row * rb, xs, K);
         if ((threadIdx.x & 31) == 0) y[row] = v;
     }
 }
@@ -6281,13 +6623,32 @@ void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* bas
 int block_values(int type) {
     return type == kNVFP4 ? 64 : type == kQ8_0 ? 32
          : type == kQ5_K || type == kQ6_K || type == kIQ3_XXS || type == kIQ4_XS || type == kQ4_K ? 256
+         : type == kIQ2_XXS || type == kIQ2_XS || type == kIQ2_S || type == kIQ3_S || type == kIQ1_S ? 256
+         : type == kQ2_0 ? 64 : type == kBF16 ? 1
          : type == kQ5_0 || type == kIQ4_NL ? 32 : 0;
 }
 size_t block_bytes(int type) {
     return type == kNVFP4 ? 36 : type == kQ8_0 ? 34 : type == kQ5_K ? 176 : type == kQ6_K ? 210
          : type == kIQ3_XXS ? 98 : type == kIQ4_XS ? 136 : type == kQ4_K ? 144 : type == kQ5_0 ? 22
-         : type == kIQ4_NL ? 18 : 0;
+         : type == kIQ4_NL ? 18 : type == kIQ2_XXS ? 66 : type == kIQ2_XS ? 74 : type == kIQ2_S ? 82
+         : type == kIQ3_S ? 110 : type == kIQ1_S ? 50 : type == kQ2_0 ? 18 : type == kBF16 ? 2 : 0;
 }
+
+static bool tok_ty_ok(int t) {   // (AMD port) a type the token kernels take at compile time
+    static const bool on = !(getenv("IK2_TOKTY") && !atoi(getenv("IK2_TOKTY")));
+    return gsq_type(t) || (on && (t == kIQ3_XXS || t == kIQ4_NL));
+}
+#define IK2_GSQ_SWITCH(ty, X) \
+    switch (ty) { \
+    case kIQ3_XXS: X(kIQ3_XXS); break; \
+    case kIQ4_NL: X(kIQ4_NL); break; \
+    case kIQ2_XXS: X(kIQ2_XXS); break; \
+    case kIQ2_XS: X(kIQ2_XS); break; \
+    case kIQ2_S: X(kIQ2_S); break; \
+    case kIQ3_S: X(kIQ3_S); break; \
+    case kIQ1_S: X(kIQ1_S); break; \
+    default: X(kQ2_0); break; \
+    }
 
 template <int WARPS, int ROWS>
 void launch_experts_gate_up(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,
@@ -6311,7 +6672,12 @@ void launch_experts_down(const uint8_t* const* blob, int S, int ty_down, size_t 
     if (spec && ty_down == kNVFP4)
         experts_down_kernel<WARPS, ROWS, kNVFP4><<<g, WARPS * 32, xp_floats(F) * 4, s>>>(
             blob, ty_down, off_down, h, C, F, mv_row_bytes(ty_down, F), y);
-    else
+    else if (tok_ty_ok(ty_down) && F % 32 == 0) {
+#define IK2_DOWN(T) experts_down_kernel<WARPS, ROWS, T><<<g, WARPS * 32, xp_floats(F) * 4, s>>>( \
+            blob, ty_down, off_down, h, C, F, mv_row_bytes(ty_down, F), y)
+        IK2_GSQ_SWITCH(ty_down, IK2_DOWN)
+#undef IK2_DOWN
+    } else
         experts_down_kernel<WARPS, ROWS><<<g, WARPS * 32, xp_floats(F) * 4, s>>>(
             blob, ty_down, off_down, h, C, F, mv_row_bytes(ty_down, F), y);
 }
@@ -6477,7 +6843,13 @@ void launch_experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, i
         experts_gate_up_swiglu_kernel<WARPS, ROWS, kNVFP4><<<g, WARPS * 32, xp_floats(C) * 4, s>>>(
             blob, tok, ty_gate, ty_up, eb0, x, C, F, mv_row_bytes(ty_gate, C), mv_row_bytes(ty_up, C), sg, su, gcap,
             ucap, h, orow, h_ld > 0 ? h_ld : F);
-    else
+    else if (tok_ty_ok(ty_gate) && ty_gate == ty_up && C % 32 == 0) {
+#define IK2_GU(T) experts_gate_up_swiglu_kernel<WARPS, ROWS, T><<<g, WARPS * 32, xp_floats(C) * 4, s>>>( \
+            blob, tok, ty_gate, ty_up, eb0, x, C, F, mv_row_bytes(ty_gate, C), mv_row_bytes(ty_up, C), sg, su, gcap, \
+            ucap, h, orow, h_ld > 0 ? h_ld : F)
+        IK2_GSQ_SWITCH(ty_gate, IK2_GU)
+#undef IK2_GU
+    } else
         experts_gate_up_swiglu_kernel<WARPS, ROWS><<<g, WARPS * 32, xp_floats(C) * 4, s>>>(
             blob, tok, ty_gate, ty_up, eb0, x, C, F, mv_row_bytes(ty_gate, C), mv_row_bytes(ty_up, C), sg, su, gcap,
             ucap, h, orow, h_ld > 0 ? h_ld : F);
@@ -6602,7 +6974,12 @@ void launch_mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, 
     if (spec && type == kQ6_K)
         mv_blocks_kernel<WARPS, ROWS, kQ6_K><<<(unsigned) ((N + WARPS * ROWS - 1) / (WARPS * ROWS)), WARPS * 32,
                                                xp_floats(K) * 4, s>>>(type, W, N, K, mv_row_bytes(type, K), x, y);
-    else
+    else if (gsq_type(type) && K % 32 == 0) {
+#define IK2_MV(T) mv_blocks_kernel<WARPS, ROWS, T><<<(unsigned) ((N + WARPS * ROWS - 1) / (WARPS * ROWS)), \
+            WARPS * 32, xp_floats(K) * 4, s>>>(type, W, N, K, mv_row_bytes(type, K), x, y)
+        IK2_GSQ_SWITCH(type, IK2_MV)
+#undef IK2_MV
+    } else
         mv_blocks_kernel<WARPS, ROWS><<<(unsigned) ((N + WARPS * ROWS - 1) / (WARPS * ROWS)), WARPS * 32,
                                         xp_floats(K) * 4, s>>>(type, W, N, K, mv_row_bytes(type, K), x, y);
 }

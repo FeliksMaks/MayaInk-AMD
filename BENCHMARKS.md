@@ -4,7 +4,7 @@
 
 - AMD Radeon RX 7900 XT 20 GB, connected externally; AMD Radeon 8060S iGPU with 48 GB of shared memory assigned.
   Windows 11, ROCm SDK 7.14.1.
-- `Inkling-2-Mini-UD-IQ4_XS.gguf`, every expert in VRAM, FP16 KV cache, greedy decoding, no drafting, one sequence.
+- `Inkling-2-Mini-UD-IQ4_XS.gguf` (and the GSQ-RCO file where stated), every expert in VRAM, FP16 KV cache, greedy decoding, no drafting, one sequence.
 - `IK2_GATE_BF16=1`, `IK2_GATE_TILE=64`, context 40,960 unless stated.
 - Each run is a fresh process; one unmeasured run per build first warms the file cache; builds alternate between rounds.
   Prompts are fixed token ids, the same for every build (`scripts/bench.py` reproduces this).
@@ -19,6 +19,37 @@
 | 32,760 | 3,490 | 91 | 1,370 | 36 |
 
 Prompt chunk 4,096. Decode is over 200-400 generated tokens.
+
+### GSQ-RCO file (1.4.0)
+
+`Inkling-2-Mini-GSQ-RCO-IQ3_S.gguf`, chunk 4,096, `IK2_GATE_FUSE=16`, 3 alternating rounds, 128 generated tokens (medians,
+tok/s). Default (`IK2_REQ8=1` for this file) against `IK2_REQ8=0` (the file's dense weights as they are):
+
+| Prompt | XT prompt | XT decode | XT decode, `IK2_REQ8=0` | 8060S prompt | 8060S decode | 8060S decode, `IK2_REQ8=0` |
+|---|---|---|---|---|---|---|
+| 27 | - | 103.0 | 77.0 | - | 43.4 | 39.1 |
+| 511 | 1,836 | 101.3 | 76.0 | | | |
+| 4,095 | 3,206 | 96.2 | 73.1 | 1,524 | 41.4 | 36.3 |
+| 32,760 | 2,868 | 84.7 | 65.7 | | | |
+
+Before 1.4.0's token kernels (the same file, the general expert path, no conversion), decode with a short prompt was
+65 tok/s on the XT and 34 on the 8060S. Prompt speed is about the same with and without the conversion (XT at 4K:
+3,206 against 3,539 in this run, 3,000 against 3,129 in an earlier one; at 32K 2,868 against 2,870).
+
+Reference agreement (llama.cpp b12720, `scripts/reference-gsq.json` and two long prompts), default settings: 186/188
+decode and 188/192 prompt positions short, 93/94 and 95/96 long on the XT, 187/188, 189/192, 93/94 and 95/96 on the
+8060S (the release binary), no hard miss; with `IK2_REQ8=0`: 186/188, 191/192, 94/94
+and 96/96. The IQ3_XXS / IQ4_NL token kernels give the same tokens as the general path (both files).
+
+Quality of the two files against each other (the engine's prompt path, RX 7900 XT, 10 chunks of 2,048 tokens of mixed
+code and prose, the second half of each scored as llama-perplexity does): perplexity 1.898 for UD-IQ4_XS and 1.919 for
+GSQ-RCO (+1.1%, bootstrap 95% interval +0.7% to +1.6%); the two files pick the same top token at 96.9% of the 10,230
+positions. On a small set of maths problems with exact answers and Python functions checked by unit tests (llama.cpp,
+greedy), they scored 39/40 and 25/25 (UD) against 39/40 and 24/25 (GSQ).
+
+UD-IQ4_XS file, 1.4.0 against 1.3.0 in the same alternating runs: the same generated tokens at every length on both GPUs,
+and the same speed (XT decode 107.4 / 109.3 at 27 tokens, 104.9 / 105.7 at 4K, 89.1 / 89.7 at 32K; prompt 3,619 / 3,626 at
+4K; 8060S decode 46.2 / 47.6 and 44.3 / 44.6, prompt 1,679 / 1,654 at 4K).
 
 ### Loop gates in one pass (1.3.0)
 

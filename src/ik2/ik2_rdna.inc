@@ -213,11 +213,16 @@ __device__ __forceinline__ void rm_store_half(const uint32_t (&w)[9], int half, 
 // 16 bytes and 16 .. 31 the high ones (Q5_0, IQ4_NL, IQ4_XS); the K formats' 32 are one nibble of 32 bytes.
 template <int TY>
 constexpr int rm_words() {
-    return TY == kQ5_K ? 20 : TY == kQ4_K ? 12 : TY == kIQ4_XS ? 6 : TY == kQ5_0 ? 6 : TY == kIQ4_NL ? 5 : 9;
+    return gsq_tile_type(TY) ? 2   // (the row's address: the GSQ types read their sub-block in rm_store32)
+         : TY == kQ5_K ? 20 : TY == kQ4_K ? 12 : TY == kIQ4_XS ? 6 : TY == kQ5_0 ? 6 : TY == kIQ4_NL ? 5 : 9;
 }
 template <int TY>
 __device__ __forceinline__ void rm_load32(const uint8_t* row, int b32, uint32_t* w) {
-    if constexpr (TY == kQ5_K || TY == kQ4_K) {
+    if constexpr (gsq_tile_type(TY)) {
+        const uintptr_t a = (uintptr_t) row;
+        w[0] = (uint32_t) a, w[1] = (uint32_t) ((uint64_t) a >> 32);
+        (void) b32;
+    } else if constexpr (TY == kQ5_K || TY == kQ4_K) {
         const uint32_t* p = (const uint32_t*) (row + (size_t) (b32 >> 3) * (TY == kQ5_K ? 176 : 144));
         const int is = b32 & 7;
 #pragma unroll
@@ -257,7 +262,13 @@ __device__ __forceinline__ uint32_t rm_iq4_bytes(uint32_t n) {   // four codes (
 template <int TY>
 __device__ __forceinline__ void rm_store32(const uint32_t* w, int b32, uint16_t* dst) {
     uint32_t h[16];
-    if constexpr (TY == kQ5_K || TY == kQ4_K) {
+    if constexpr (gsq_tile_type(TY)) {
+        const uint8_t* row = (const uint8_t*) (uintptr_t) ((uint64_t) w[0] | ((uint64_t) w[1] << 32));
+        float y[32];
+        gsq_vals32<TY>(row, b32, y);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) h[i] = f2_to_u32(y[2 * i], y[2 * i + 1]);
+    } else if constexpr (TY == kQ5_K || TY == kQ4_K) {
         const int is = b32 & 7;
         const float d = half_bits_to_float((uint16_t) (w[0] & 0xFFFFu)), mn = half_bits_to_float((uint16_t) (w[0] >> 16));
         auto by = [&](int i) { return (w[1 + (i >> 2)] >> (8 * (i & 3))) & 0xFFu; };   // (scales: 12 bytes, words 1 .. 3)
@@ -1516,7 +1527,7 @@ __global__ void __launch_bounds__(256) gemm_f32_kernel(const float* __restrict__
         if (tt + i < nt)
             *(float4*) (Y + (size_t) (t0 + tt + i) * ldy + n0 + nn) = make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
 }
-// a looped layer's gate down products for a chunk: a1 [T][64] = x D_x^T and a2 = m D_m^T
+// (AMD port) a looped layer's gate down products for a chunk: a1 [T][64] = x D_x^T and a2 = m D_m^T
 // (D [64][2 C]: x's half, then m's), one launch for both (blockIdx.y), 32 tokens x 64 outputs a block of 128 threads,
 // 4 x 4 a thread; each output one F32 sum in k order
 constexpr int kGdT = 32, kGdK = 32, kGdLd = kGdK + 4;
@@ -1595,7 +1606,7 @@ bool loop_gate_down_rdna(const float* x, const float* m, const float* D, int T, 
     check("loop_gate_down_rdna");
     return true;
 }
-// the gate's down products and its mix in one kernel: a block of NT tokens (16 or 32) runs x's half,
+// (AMD port) the gate's down products and its mix in one kernel: a block of 32 tokens runs x's half,
 // then m's, with each row's sum of squares taken from the loads it stages; g = a1 / rms(x) + a2 / rms(m)
 template <int NT>
 __global__ void __launch_bounds__(4 * NT) loop_gate_downmix_kernel(const float* __restrict__ x, const float* __restrict__ m,
@@ -1797,7 +1808,11 @@ bool experts_rdna_available(int ty_gate, int ty_up, int ty_down, int C, int F) {
     const bool mix = mix_on && ty_up == ty_gate && (ty_gate == kQ5_K || ty_gate == kQ4_K || ty_gate == kIQ4_XS) &&
                      (ty_down == kQ5_0 || ty_down == kIQ4_NL) && experts_rdna_rows() == 128 && rdna_n256(true) &&
                      rdna_n256(false) && C % 256 == 0 && F % 128 == 0;
-    return on && (fmt || mix) && C % kRmBN == 0 && F % kRmBN == 0 && C % kRmBK == 0 && F % kRmBK == 0;
+    static const bool gsq_on = !(std::getenv("IK2_RDNA_GSQ") && !std::atoi(std::getenv("IK2_RDNA_GSQ")));
+    const bool gsq = gsq_on && ty_up == ty_gate && gsq_tile_type(ty_gate) && ty_gate != kQ2_0 &&
+                     (ty_down == kIQ4_NL || ty_down == kQ2_0) && experts_rdna_rows() == 128 && rdna_n256(true) &&
+                     rdna_n256(false) && C % 256 == 0 && F % 128 == 0;
+    return on && (fmt || mix || gsq) && C % kRmBN == 0 && F % kRmBN == 0 && C % kRmBK == 0 && F % kRmBK == 0;
 }
 void experts_rdna_gu(const uint8_t* const* eptr, const int* tiles, int n_tiles, int ty, size_t off_up,
                      const uint16_t* x16, int C, int F, const float* sg, const float* su, float gcap, float ucap,
@@ -1815,6 +1830,10 @@ void experts_rdna_gu(const uint8_t* const* eptr, const int* tiles, int n_tiles, 
             experts_rdna256_kernel<kQ4_K, true><<<g2, 256, 0, s>>>(eptr, (const int4*) tiles, off_up, rb, x16, C, F, C, sg, su, gcap, ucap, h16, nullptr, gidx);
         else if (ty == kIQ4_XS)
             experts_rdna256_kernel<kIQ4_XS, true><<<g2, 256, 0, s>>>(eptr, (const int4*) tiles, off_up, rb, x16, C, F, C, sg, su, gcap, ucap, h16, nullptr, gidx);
+#define IK2_GU256(T) else if (ty == T) \
+            experts_rdna256_kernel<T, true><<<g2, 256, 0, s>>>(eptr, (const int4*) tiles, off_up, rb, x16, C, F, C, sg, su, gcap, ucap, h16, nullptr, gidx);
+        IK2_GU256(kIQ1_S) IK2_GU256(kIQ2_XXS) IK2_GU256(kIQ2_XS) IK2_GU256(kIQ2_S) IK2_GU256(kIQ3_XXS) IK2_GU256(kIQ3_S)
+#undef IK2_GU256
         else
             experts_rdna256_kernel<kQ8_0, true><<<g2, 256, 0, s>>>(eptr, (const int4*) tiles, off_up, rb, x16, C, F, C, sg, su, gcap, ucap, h16, nullptr, gidx);
         check("experts_rdna256");
@@ -1852,6 +1871,8 @@ void experts_rdna_down(const uint8_t* const* eptr, const int* tiles, int n_tiles
             experts_rdna256_kernel<kQ5_0, false><<<g2, 256, 0, s>>>(eptr, (const int4*) tiles, off_down, rb, h16, F, F, C, nullptr, nullptr, 0.0f, 0.0f, nullptr, y32, gidx);
         else if (ty == kIQ4_NL)
             experts_rdna256_kernel<kIQ4_NL, false><<<g2, 256, 0, s>>>(eptr, (const int4*) tiles, off_down, rb, h16, F, F, C, nullptr, nullptr, 0.0f, 0.0f, nullptr, y32, gidx);
+        else if (ty == kQ2_0)
+            experts_rdna256_kernel<kQ2_0, false><<<g2, 256, 0, s>>>(eptr, (const int4*) tiles, off_down, rb, h16, F, F, C, nullptr, nullptr, 0.0f, 0.0f, nullptr, y32, gidx);
         else
             experts_rdna256_kernel<kQ8_0, false><<<g2, 256, 0, s>>>(eptr, (const int4*) tiles, off_down, rb, h16, F, F, C, nullptr, nullptr, 0.0f, 0.0f, nullptr, y32, gidx);
         check("experts_rdna256");

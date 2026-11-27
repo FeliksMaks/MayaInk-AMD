@@ -44,6 +44,12 @@ This repository contains code from the following projects.
    From that project's NOTICE: "Ciru's AMD runtime changes, fitted weight files and packaging are distributed under the
    Apache License, Version 2.0."
 
+5. ggml (through llama.cpp)
+   https://github.com/ggml-org/ggml, commit 3cf03257f219afbe7334045ff7c6a06ac68c627d (third_party/ggml/VERSION.txt)
+   Copyright (c) 2023-2026 The ggml authors; MIT License, see third_party/ggml/LICENSE.
+   Used: third_party/ggml/ggml-common.h (unchanged): the block layouts and codebook grids of the i-quant formats of the
+   GSQ-RCO file, read by src/ik2/ik2_iq_grids.h.
+
 Used for testing only, not included:
 - llama.cpp (https://github.com/ggml-org/llama.cpp, MIT): its greedy output is the reference of scripts/gate.py and
   scripts/reference.json.
@@ -53,4 +59,7 @@ Model, not included:
 - Inkling 2 Mini by Thinking Machines Lab, Apache License 2.0, https://huggingface.co/thinkingmachines/Inkling-2-Mini
 - GGUF conversion by Unsloth, https://huggingface.co/unsloth/Inkling-2-Mini-GGUF
   (Inkling-2-Mini-UD-IQ4_XS.gguf at revision ae9327c5fbc7333116ba32eee78bb5d2bbefae4f)
-- scripts/reference.json holds token ids and log-probabilities that llama.cpp produced from that model.
+- GGUF quantization by ISTA-DASLab, https://huggingface.co/ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF
+  (Inkling-2-Mini-GSQ-RCO-IQ3_S.gguf at revision f0da1097633dd7c2f5733e4077cff861be122245)
+- scripts/reference.json and scripts/reference-gsq.json hold token ids and log-probabilities that llama.cpp produced
+  from those files (reference-gsq.json with llama.cpp b12720).
